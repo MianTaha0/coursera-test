@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <title>AI Background Removal - Remove Backgrounds Instantly</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- Navigation Bar -->
+    <section class="nav_bar">
+        <div class="logo">
+            <img class="logo-img" src="assets/logo.png" alt="Logo" width="150">
+        </div>
+        <div class="nav-items">
+            <a href="#home">Home</a>
+            <a href="#tools">Tools</a>
+            <a href="#gallery">Gallery</a>
+            <a href="#pricing">Pricing</a>
+        </div>
+        <div class="nav-button">
+            <a href="#signin">Sign in</a>
+            <a class="get-started-btn" href="#get-started">Get Started</a>
+        </div>
+    </section>
+
+    <!-- Mobile Header -->
+    <header>
+        <div class="hamburger-wrapper">
+            <img src="assets/logo.png" alt="Logo">
+            <div class="hamburger" id="hamburger">☰</div>
+            <nav class="mobile-menu" id="mobileMenu">
+                <ul>
+                    <li><a href="#home">Home</a></li>
+                    <li><a href="#tools">Tools</a></li>
+                    <li><a href="#gallery">Gallery</a></li>
+                    <li><a href="#pricing">Pricing</a></li>
+                </ul>
+                <div class="menu-buttons">
+                    <button class="sign-in">Sign In</button>
+                    <button class="lets-start">Let's Start</button>
+                </div>
+            </nav>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <section style="width: 100%; display: flex; justify-content: center;">
+        <section class="main">
+            <!-- Left Section -->
+            <div class="left">
+                <div style="display: flex; color: #46EDD5; text-align: center;">
+                    <p class="AI">
+                        <img style="background-color: #042F2E;" src="assets/ai-icon.png" alt="AI Icon"> 
+                        AI-Powered Background Removal
+                    </p>
+                </div>
+                
+                <h1>Remove</h1>
+                <h1>Backgrounds</h1>
+                <h1 class="gradient-text">Instantly</h1>
+                
+                <br>
+                <p style="color: #A1A1A1; font-family: 'Inter', sans-serif;">
+                    Professional background removal in seconds. No sign-up<br> 
+                    required. Perfect for e-commerce, social media,<br> 
+                    and creative projects
+                </p>
+                <br>
+                
+                <div class="left_button">
+                    <button class="img-button" id="uploadImageBtn">
+                        <img style="background: transparent; width: 22px; padding-right: 10px;" 
+                             src="assets/upload-icon.png" alt="Upload">
+                        Upload Image
+                    </button>
+                    <button class="img-button2" id="freeDemoBtn">
+                        Try Free Demo
+                    </button>
+                </div>
+                
+                <br>
+                
+                <!-- Feature Dots -->
+                <div class="dot-labels">
+                    <div class="dot-label">
+                        <span class="dot" style="background-color: #0DB5AA;"></span>
+                        <span class="label-text">Free to try</span>
+                    </div>
+                    <div class="dot-label">
+                        <span class="dot" style="background-color: #0073EE;"></span>
+                        <span class="label-text">No watermarks</span>
+                    </div>
+                    <div class="dot-label">
+                        <span class="dot" style="background-color: #B28EFF;"></span>
+                        <span class="label-text">4K quality</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Section - Image Upload -->
+            <section class="right-content" aria-label="Image upload and before after preview">
+                <!-- Upload Area -->
+                <label class="upload-box" tabindex="0" aria-describedby="upload-desc" role="button">
+                    <span class="upload-icon-wrapper" aria-hidden="true">
+                        <img style="background: transparent;" src="assets/upload-graphic.png" alt="Upload graphic">
+                    </span>
+                    <span class="upload-text">Drop your image here</span>
+                    <span class="upload-subtext">Or click browse from your device</span>
+                    <button type="button" class="btn-choose" aria-label="Choose image from device">
+                        <img style="background: transparent; width: 22px; padding-right: 10px;" 
+                             src="assets/image-icon.png" alt="Image">
+                        Choose Image
+                    </button>
+                    <input type="file" accept=".jpg, .jpeg, .png, .webp" id="file-upload-btn" 
+                           style="display:none" aria-hidden="true" />
+                    <span id="upload-desc" class="upload-support" aria-live="polite">
+                        Support JPG, PNG, WEBP up to 10MB
+                    </span>
+                </label>
+
+                <!-- Status and Loading -->
+                <div class="status" id="status"></div>
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p>Processing your image... This may take a few moments.</p>
+                </div>
+
+                <!-- Preview Area -->
+                <div class="preview-wrapper" aria-label="Before and after images" id="previewWrapper">
+                    <figure class="preview-box">
+                        <figcaption class="preview-label">Before</figcaption>
+                        <img class="preview-image" id="beforeImage"
+                             src="assets/demo-before.png"
+                             alt="Before image - example of woman in autumn park"
+                             onerror="this.style.display='none'" />
+                    </figure>
+                    
+                    <figure class="preview-box">
+                        <figcaption class="preview-label">After</figcaption>
+                        <img class="preview-image" id="afterImage" 
+                             src="assets/demo-after.png"
+                             alt="After image - background removed with transparent background"
+                             onerror="this.style.display='none'" />
+                        
+                        <!-- Download Button -->
+                        <div id="downloadContainer" style="display: none; margin-top: 15px;">
+                            <a class="download-btn" id="downloadBtn" download="processed_image.png">
+                                <i class="fas fa-download"></i> Download Image
+                            </a>
+                        </div>
+                    </figure>
+                </div>
+
+                <!-- Process Button -->
+                <button class="process-btn" id="processBtn" style="display: none;">
+                    Remove Background
+                </button>
+            </section>
+        </section>
+    </section>
+
+    <!-- JavaScript -->
+    <script>
+        const API_BASE = 'http://localhost:5000';
+        let selectedFile = null;
+
+        // DOM elements
+        const hamburger = document.getElementById('hamburger');
+        const mobileMenu = document.getElementById('mobileMenu');
+        const fileInput = document.getElementById('file-upload-btn');
+        const uploadBox = document.querySelector('.upload-box');
+        const chooseBtn = document.querySelector('.btn-choose');
+        const uploadImageBtn = document.getElementById('uploadImageBtn');
+        const freeDemoBtn = document.getElementById('freeDemoBtn');
+        const processBtn = document.getElementById('processBtn');
+        const status = document.getElementById('status');
+        const loading = document.getElementById('loading');
+        const previewWrapper = document.getElementById('previewWrapper');
+        const beforeImage = document.getElementById('beforeImage');
+        const afterImage = document.getElementById('afterImage');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const downloadContainer = document.getElementById('downloadContainer');
+
+        // Mobile menu toggle
+        hamburger.addEventListener('click', () => {
+            mobileMenu.style.display = (mobileMenu.style.display === 'block') ? 'none' : 'block';
+        });
+
+        window.addEventListener('resize', () => {
+            if (window.innerWidth > 768) {
+                mobileMenu.style.display = 'none';
+            }
+        });
+
+        // File upload handlers
+        chooseBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            fileInput.click();
+        });
+
+        uploadImageBtn.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', handleFileSelect);
+
+        // Drag and drop
+        uploadBox.addEventListener('dragover', handleDragOver);
+        uploadBox.addEventListener('dragleave', handleDragLeave);
+        uploadBox.addEventListener('drop', handleDrop);
+
+        // Process button
+        processBtn.addEventListener('click', processImage);
+
+        // Demo button
+        freeDemoBtn.addEventListener('click', () => {
+            showStatus('Demo mode - Upload an image to see the AI in action!', 'info');
+        });
+
+        function handleFileSelect(e) {
+            const file = e.target.files[0];
+            if (file) {
+                displayFile(file);
+            }
+        }
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            uploadBox.classList.add('dragover');
+        }
+
+        function handleDragLeave(e) {
+            e.preventDefault();
+            uploadBox.classList.remove('dragover');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            uploadBox.classList.remove('dragover');
+
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                const file = files[0];
+                if (file.type.startsWith('image/')) {
+                    displayFile(file);
+                } else {
+                    showStatus('Please select an image file.', 'error');
+                }
+            }
+        }
+
+        function displayFile(file) {
+            selectedFile = file;
+
+            // Show preview
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                beforeImage.src = e.target.result;
+                processBtn.style.display = 'block';
+                
+                // Hide processed result
+                afterImage.style.display = 'none';
+                downloadContainer.style.display = 'none';
+                
+                // Reset demo images
+                afterImage.src = 'assets/demo-after.png';
+            };
+            reader.readAsDataURL(file);
+
+            showStatus(`Selected: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`, 'info');
+        }
+
+        async function processImage() {
+            if (!selectedFile) {
+                showStatus('Please select an image first.', 'error');
+                return;
+            }
+
+            // Show loading
+            loading.style.display = 'block';
+            processBtn.disabled = true;
+            status.style.display = 'none';
+
+            try {
+                // Create form data
+                const formData = new FormData();
+                formData.append('file', selectedFile);
+
+                // Upload and process
+                const response = await fetch(`${API_BASE}/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    // Success - download the processed image
+                    const downloadUrl = `${API_BASE}${result.download_url}`;
+
+                    // Download and display
+                    const imageResponse = await fetch(downloadUrl);
+                    const imageBlob = await imageResponse.blob();
+                    const imageUrl = URL.createObjectURL(imageBlob);
+
+                    // Show processed image
+                    afterImage.src = imageUrl;
+                    afterImage.style.display = 'block';
+
+                    // Setup download
+                    downloadBtn.href = imageUrl;
+                    downloadBtn.download = `processed_${selectedFile.name.split('.')[0]}.png`;
+                    downloadContainer.style.display = 'block';
+
+                    showStatus('Background removed successfully!', 'success');
+                } else {
+                    showStatus(`Error: ${result.error}`, 'error');
+                }
+
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus(`Network error: ${error.message}`, 'error');
+            } finally {
+                // Hide loading
+                loading.style.display = 'none';
+                processBtn.disabled = false;
+            }
+        }
+
+        function showStatus(message, type) {
+            status.textContent = message;
+            status.className = `status ${type}`;
+            status.style.display = 'block';
+
+            // Auto-hide after 5 seconds for success messages
+            if (type === 'success') {
+                setTimeout(() => {
+                    status.style.display = 'none';
+                }, 5000);
+            }
+        }
+
+        // Check if API is running on page load
+        window.addEventListener('load', async () => {
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                if (response.ok) {
+                    console.log('API is running');
+                } else {
+                    showStatus('API server is not responding. Make sure the Flask app is running.', 'error');
+                }
+            } catch (error) {
+                showStatus('Cannot connect to API server. Make sure the Flask app is running on localhost:5000.', 'error');
+            }
+        });
+    </script>
+</body>
+
+</html>
