@@ -194,6 +194,19 @@ class BreakDetector:
 			cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
 		for (cx, cy, _) in cands:
 			cv2.circle(frame, (ox + cx, oy + cy), 6, (0, 0, 255), 2)
+		# Draw a triangle around the cluster using the minimal enclosing triangle
+		if len(cands) >= 3:
+			pts = np.array([[cx, cy] for (cx, cy, _) in cands], dtype=np.float32).reshape(-1, 1, 2)
+			try:
+				_, tri = cv2.minEnclosingTriangle(pts)
+				if tri is not None and tri.shape == (3, 1, 2):
+					tri_pts = tri.reshape(3, 2).astype(int)
+					for i in range(3):
+						p1 = (ox + int(tri_pts[i, 0]), oy + int(tri_pts[i, 1]))
+						p2 = (ox + int(tri_pts[(i + 1) % 3, 0]), oy + int(tri_pts[(i + 1) % 3, 1]))
+						cv2.line(frame, p1, p2, (0, 255, 255), 2)
+			except Exception:
+				pass
 		text = f"State: {self.state}  Count: {self.break_count}  Disp(px): {dispersion:.1f}  EMA: {0.0 if self.radius_ema is None else self.radius_ema:.1f}"
 		cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 220, 50), 2, cv2.LINE_AA)
 
