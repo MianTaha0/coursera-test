@@ -1,3 +1,52 @@
+## Snooker Rack Break Detector
+
+Beginner-friendly OpenCV app that counts a snooker break only once per rack break. It uses a robust state machine with hysteresis and a simple calibration step to define the rack Region of Interest (ROI).
+
+### Features
+- Counts exactly one when the rack is broken, with hysteresis to avoid double counts
+- Optional calibration to select the rack ROI via a rectangle
+- Simple ball-like object detection by excluding table green and clustering centroids
+- Works with webcam (`--source 0`) or video file path
+- CLI with useful knobs; on-screen overlay when GUI is available
+
+### Install
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Run
+
+Webcam with on-screen window and guided calibration:
+
+```bash
+python -m snooker_break_detector.main --source 0
+```
+
+Video file with no GUI (headless):
+
+```bash
+python -m snooker_break_detector.main --source /path/to/video.mp4 --no-gui
+```
+
+### Controls (when GUI is enabled)
+- `c`: Calibrate ROI using a drag rectangle (cv2.selectROI)
+- `r`: Re-arm after a break, or when ready for the next rack
+- `q` or `ESC`: Quit
+
+### How it works (brief)
+- Detects non-green blobs inside the ROI and filters for roundness and plausible area
+- Computes a dispersion metric (average distance to cluster centroid) and smooths it
+- State machine:
+  - IDLE: Waiting for a tight cluster (rack). Arms after N stable frames
+  - ARMED: Waiting for dispersion to exceed threshold for M frames. On success, increments count exactly once
+  - After a break is counted, waits until a new rack forms (tight cluster) or you press `r` to re-arm
+
+### Notes
+- Lighting and camera angle matter. Adjust thresholds using CLI flags if needed
+- Save/load ROI with `--save-roi` and `--roi`
+
 # Background Removal API
 
 A simple Flask API that removes backgrounds from images and replaces them with a white background. Perfect for beginners who want to create a dynamic image processing service.
