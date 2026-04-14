@@ -1,6 +1,6 @@
 /* ============================================================
    KALLYAS - Business Agency Website
-   Custom Stylesheet
+   Pure CSS Stylesheet (No JavaScript)
    ============================================================ */
 
 /* ---------- CSS Variables ---------- */
@@ -23,7 +23,9 @@
     padding: 0;
 }
 
-html { scroll-behavior: smooth; }
+html {
+    scroll-behavior: smooth; /* CSS smooth scrolling - no JS needed */
+}
 
 body {
     font-family: var(--font);
@@ -32,65 +34,117 @@ body {
     line-height: 1.7;
 }
 
-/* ---------- Utility Classes ---------- */
-.text-red      { color: var(--red) !important; }
-.btn-red       { background-color: var(--red); color: var(--white); border: 2px solid var(--red); border-radius: 3px; }
-.btn-red:hover { background-color: #c0392b; border-color: #c0392b; color: var(--white); }
-
-.btn-outline-white        { color: var(--white); border: 2px solid var(--white); border-radius: 3px; }
-.btn-outline-white:hover  { background-color: var(--white); color: var(--dark); }
-
+/* ---------- Utility ---------- */
+.text-red { color: var(--red) !important; }
 .text-light-custom { color: rgba(255, 255, 255, 0.7); }
 
+/* ---------- Reusable Buttons ---------- */
+.btn-red-solid {
+    display: inline-block;
+    background-color: var(--red);
+    color: var(--white);
+    border: 2px solid var(--red);
+    padding: 13px 34px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+    border-radius: 3px;
+    transition: background-color 0.3s, border-color 0.3s;
+}
+.btn-red-solid:hover {
+    background-color: #c0392b;
+    border-color: #c0392b;
+    color: var(--white);
+}
+.btn-red-solid.w-100 { width: 100%; text-align: center; }
+
+.btn-white-outline {
+    display: inline-block;
+    color: var(--white);
+    border: 2px solid var(--white);
+    padding: 13px 34px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+    border-radius: 3px;
+    transition: background-color 0.3s, color 0.3s;
+}
+.btn-white-outline:hover {
+    background-color: var(--white);
+    color: var(--dark);
+}
+
+.btn-dark-outline {
+    display: inline-block;
+    color: var(--text-dark);
+    border: 2px solid var(--text-dark);
+    padding: 12px 30px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+    border-radius: 3px;
+    transition: background-color 0.3s, color 0.3s;
+}
+.btn-dark-outline:hover {
+    background-color: var(--text-dark);
+    color: var(--white);
+}
+
 /* ============================================================
-   NAVIGATION
+   NAVIGATION  (CSS-only, responsive with flexbox)
    ============================================================ */
-#mainNav {
-    background-color: var(--dark) !important;
+.site-nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1000;
+    background-color: var(--dark);
     padding: 14px 0;
-    transition: background-color 0.3s, box-shadow 0.3s;
+    box-shadow: 0 2px 15px rgba(0,0,0,0.3);
 }
 
-#mainNav.scrolled {
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+.nav-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
 }
 
-.navbar-brand {
+.nav-brand {
     font-size: 1.7rem;
     font-weight: 800;
-    color: var(--white) !important;
-    letter-spacing: 2px;
+    color: var(--white);
     text-decoration: none;
+    letter-spacing: 2px;
 }
 
 .brand-dot { color: var(--red); }
 
-.nav-link {
-    color: rgba(255, 255, 255, 0.8) !important;
+.nav-links {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+}
+
+.nav-links a {
+    color: rgba(255, 255, 255, 0.8);
+    text-decoration: none;
     font-size: 0.88rem;
     font-weight: 500;
-    margin: 0 8px;
-    padding: 5px 0 !important;
-    position: relative;
-    transition: color 0.3s;
+    padding: 6px 12px;
+    border-radius: 3px;
+    transition: color 0.3s, background-color 0.3s;
 }
 
-.nav-link::after {
-    content: '';
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    width: 0;
-    height: 2px;
-    background-color: var(--red);
-    transition: width 0.3s;
+.nav-links a:hover {
+    color: var(--white);
+    background-color: rgba(231, 76, 60, 0.15);
 }
-
-.nav-link:hover,
-.nav-link.active { color: var(--white) !important; }
-
-.nav-link:hover::after,
-.nav-link.active::after { width: 100%; }
 
 /* ============================================================
    HERO SECTION
@@ -99,9 +153,7 @@ body {
     background-image: url('https://images.unsplash.com/photo-1552664730-d307ca884978?w=1600&q=80');
     background-size: cover;
     background-position: center center;
-    background-attachment: fixed;
     min-height: 100vh;
-    position: relative;
 }
 
 .hero-overlay {
@@ -127,11 +179,10 @@ body {
     margin-bottom: 35px;
 }
 
-.hero-buttons .btn {
-    padding: 13px 34px;
-    font-size: 0.9rem;
-    font-weight: 600;
-    letter-spacing: 0.5px;
+.hero-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
 }
 
 /* ============================================================
@@ -150,7 +201,7 @@ body {
     transition: transform 0.3s;
 }
 
-.feature-card:hover { transform: translateY(-5px); }
+.feature-card:hover { transform: translateY(-6px); }
 
 .card-red    { background-color: var(--red); }
 .card-dark   { background-color: var(--dark-card); }
@@ -220,7 +271,7 @@ body {
     font-size: 2rem;
     color: #c5c5c5;
     margin: 0 auto 20px;
-    transition: all 0.3s;
+    transition: border-color 0.3s, color 0.3s;
 }
 
 .service-item:hover .service-icon {
@@ -336,42 +387,6 @@ body {
     padding: 80px 0 0;
 }
 
-.portfolio-filters { margin-bottom: 30px; }
-
-.pf-btn {
-    background: none;
-    border: none;
-    padding: 8px 18px;
-    font-size: 0.88rem;
-    font-weight: 500;
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: color 0.3s;
-    position: relative;
-    font-family: var(--font);
-}
-
-.pf-btn::after {
-    content: '';
-    position: absolute;
-    bottom: 0;
-    left: 50%;
-    transform: translateX(-50%);
-    width: 0;
-    height: 2px;
-    background: var(--text-dark);
-    transition: width 0.3s;
-}
-
-.pf-btn.active,
-.pf-btn:hover { color: var(--text-dark); }
-
-.pf-btn.active::after,
-.pf-btn:hover::after { width: 70%; }
-
-.portfolio-item { overflow: hidden; }
-.portfolio-item.hidden { display: none; }
-
 .port-img-wrap {
     position: relative;
     overflow: hidden;
@@ -428,7 +443,11 @@ body {
     width: 100%;
 }
 
-.stats-img-wrap img { border-radius: 6px; width: 100%; }
+.stats-img-wrap img {
+    border-radius: 6px;
+    width: 100%;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.12);
+}
 
 .play-btn {
     position: absolute;
@@ -469,19 +488,13 @@ body {
     letter-spacing: 2px;
     text-transform: uppercase;
     display: block;
+    line-height: 1.5;
 }
 
-.client-name-sm {
-    color: rgba(255, 255, 255, 0.55);
-    font-size: 0.75rem;
-    font-weight: 700;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
+.client-icon {
+    color: rgba(255, 255, 255, 0.45);
     display: block;
-    line-height: 1.4;
 }
-
-.client-icon { color: rgba(255, 255, 255, 0.45); display: block; }
 
 .clients-section h4 {
     color: var(--white);
@@ -528,7 +541,7 @@ body {
 
 .features-img {
     border-radius: 4px;
-    box-shadow: 0 15px 40px rgba(0, 0, 0, 0.12);
+    box-shadow: 0 15px 40px rgba(0,0,0,0.12);
     max-height: 450px;
     object-fit: cover;
     width: 100%;
@@ -550,27 +563,24 @@ body {
 }
 
 .contact-input {
+    display: block;
+    width: 100%;
     border: 1px solid #e0e0e0;
     border-radius: 2px;
     padding: 13px 16px;
     font-size: 0.9rem;
     font-family: var(--font);
-    transition: border-color 0.3s, box-shadow 0.3s;
-}
-
-.contact-input:focus {
-    border-color: var(--red);
-    box-shadow: 0 0 0 3px rgba(231, 76, 60, 0.1);
+    transition: border-color 0.3s;
     outline: none;
+    color: var(--text-dark);
 }
 
+.contact-input:focus { border-color: var(--red); }
 .contact-input::placeholder { color: #bbb; }
 
-.contact-section .btn-red {
-    padding: 14px;
-    font-size: 0.95rem;
-    font-weight: 600;
-    letter-spacing: 0.5px;
+.contact-textarea {
+    min-height: 140px;
+    resize: vertical;
 }
 
 /* ============================================================
@@ -591,7 +601,10 @@ body {
 
 .footer-address p { margin-bottom: 8px; }
 
-.social-links { display: flex; gap: 10px; }
+.social-links {
+    display: flex;
+    gap: 10px;
+}
 
 .social-btn {
     width: 36px;
@@ -638,41 +651,60 @@ body {
 
 .footer-links a:hover { color: var(--red); }
 
+.newsletter-wrap {
+    display: flex;
+}
+
 .newsletter-input {
-    background: rgba(255, 255, 255, 0.08) !important;
-    border: 1px solid rgba(255, 255, 255, 0.15) !important;
-    color: var(--white) !important;
-    border-radius: 2px 0 0 2px;
+    flex: 1;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-right: none;
+    color: var(--white);
+    padding: 10px 14px;
     font-size: 0.87rem;
     font-family: var(--font);
+    outline: none;
+    border-radius: 2px 0 0 2px;
 }
 
 .newsletter-input::placeholder { color: rgba(255,255,255,0.4); }
-.newsletter-input:focus {
-    outline: none;
-    border-color: var(--red) !important;
-    box-shadow: none !important;
+.newsletter-input:focus { border-color: var(--red); }
+
+.newsletter-btn {
+    background-color: var(--red);
+    color: var(--white);
+    border: none;
+    padding: 10px 18px;
+    font-size: 0.87rem;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: var(--font);
+    border-radius: 0 2px 2px 0;
+    transition: background-color 0.3s;
 }
 
-.footer-divider {
-    border-color: rgba(255, 255, 255, 0.1);
-}
+.newsletter-btn:hover { background-color: #c0392b; }
+
+.footer-divider { border-color: rgba(255, 255, 255, 0.1); }
 
 /* ============================================================
-   RESPONSIVE BREAKPOINTS
+   RESPONSIVE
    ============================================================ */
 @media (max-width: 991px) {
     .feature-cards-section { margin-top: 0; }
-
     .cta-red-block { display: none; }
-
-    .hero-section,
-    .hero-overlay { background-attachment: scroll; }
 }
 
 @media (max-width: 767px) {
     .hero-title { font-size: 1.8rem; }
-    .hero-buttons .btn { display: block; width: 100%; margin: 0 0 12px 0 !important; }
+
+    .hero-buttons {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .hero-buttons a { width: 100%; text-align: center; }
 
     .feature-card { padding: 30px 24px; }
 
@@ -684,10 +716,14 @@ body {
 
     .port-img-wrap img { height: 180px; }
 
-    .section-title { font-size: 1.5rem; }
+    .section-title  { font-size: 1.5rem; }
     .contact-title  { font-size: 1.5rem; }
+    .why-heading    { font-size: 1.4rem; }
+    .features-title { font-size: 1.4rem; }
 }
 
 @media (max-width: 480px) {
-    .portfolio-filters .pf-btn { padding: 6px 10px; font-size: 0.8rem; }
+    .nav-inner { justify-content: center; }
+    .nav-brand  { font-size: 1.4rem; }
+    .nav-links a { font-size: 0.8rem; padding: 5px 8px; }
 }

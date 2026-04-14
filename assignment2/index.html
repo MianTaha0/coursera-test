@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kallyas - Business Agency</title>
 
-    <!-- Bootstrap CSS -->
+    <!-- Bootstrap CSS only (no JS) -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 
     <!-- Font Awesome Icons -->
@@ -20,20 +20,17 @@
 <body>
 
     <!-- ===== NAVIGATION ===== -->
-    <nav class="navbar navbar-expand-lg navbar-dark fixed-top" id="mainNav">
+    <nav class="site-nav">
         <div class="container">
-            <a class="navbar-brand" href="#">Kallyas<span class="brand-dot">.</span></a>
-            <button class="navbar-toggler border-0" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
-            <div class="collapse navbar-collapse" id="navbarNav">
-                <ul class="navbar-nav ms-auto">
-                    <li class="nav-item"><a class="nav-link" href="#home">Home</a></li>
-                    <li class="nav-item"><a class="nav-link" href="#services">Services</a></li>
-                    <li class="nav-item"><a class="nav-link" href="#portfolio">Media</a></li>
-                    <li class="nav-item"><a class="nav-link" href="#about">About Us</a></li>
-                    <li class="nav-item"><a class="nav-link" href="#features">Platform</a></li>
-                    <li class="nav-item"><a class="nav-link" href="#contact">Contact</a></li>
+            <div class="nav-inner">
+                <a class="nav-brand" href="#home">Kallyas<span class="brand-dot">.</span></a>
+                <ul class="nav-links">
+                    <li><a href="#home">Home</a></li>
+                    <li><a href="#services">Services</a></li>
+                    <li><a href="#portfolio">Media</a></li>
+                    <li><a href="#about">About Us</a></li>
+                    <li><a href="#features">Platform</a></li>
+                    <li><a href="#contact">Contact</a></li>
                 </ul>
             </div>
         </div>
@@ -44,15 +41,15 @@
         <div class="hero-overlay">
             <div class="container">
                 <div class="row align-items-center min-vh-100 py-5">
-                    <div class="col-lg-7" data-aos="fade-right">
+                    <div class="col-lg-7">
                         <h1 class="hero-title">Helping Business And Companies Innovate Transform And Lead</h1>
                         <p class="hero-text">
                             We partner with businesses of all sizes to create meaningful digital experiences.
                             From strategy to execution, we bring ideas to life with creativity and precision.
                         </p>
                         <div class="hero-buttons">
-                            <a href="#contact" class="btn btn-red btn-lg me-3">Start Now</a>
-                            <a href="#services" class="btn btn-outline-white btn-lg">Our Services</a>
+                            <a href="#contact" class="btn-red-solid">Start Now</a>
+                            <a href="#services" class="btn-white-outline">Our Services</a>
                         </div>
                     </div>
                 </div>
@@ -66,27 +63,21 @@
             <div class="row g-0">
                 <div class="col-md-4">
                     <div class="feature-card card-red">
-                        <div class="card-icon">
-                            <i class="fas fa-lightbulb"></i>
-                        </div>
+                        <div class="card-icon"><i class="fas fa-lightbulb"></i></div>
                         <h4>Content Concept &amp; Strategy</h4>
                         <p>It suggests our capabilities and potential expertise in the domain of strategic content creation and planning.</p>
                     </div>
                 </div>
                 <div class="col-md-4">
                     <div class="feature-card card-dark">
-                        <div class="card-icon">
-                            <i class="fas fa-drafting-compass"></i>
-                        </div>
+                        <div class="card-icon"><i class="fas fa-drafting-compass"></i></div>
                         <h4>Design &amp; Concepts</h4>
                         <p>It suggests our capabilities and potential expertise in the domain of creative design and conceptual thinking.</p>
                     </div>
                 </div>
                 <div class="col-md-4">
                     <div class="feature-card card-darker">
-                        <div class="card-icon">
-                            <i class="fas fa-chart-line"></i>
-                        </div>
+                        <div class="card-icon"><i class="fas fa-chart-line"></i></div>
                         <h4>SEO &amp; Marketing Solutions</h4>
                         <p>It suggests our capabilities and potential expertise in the domain of digital marketing and search optimization.</p>
                     </div>
@@ -109,54 +100,42 @@
             <div class="row g-4">
                 <div class="col-md-4">
                     <div class="service-item text-center">
-                        <div class="service-icon">
-                            <i class="fas fa-chess-king"></i>
-                        </div>
+                        <div class="service-icon"><i class="fas fa-chess-king"></i></div>
                         <h5>Strategy</h5>
                         <p>We develop data-driven strategies that align with your business goals and drive long-term growth.</p>
                     </div>
                 </div>
                 <div class="col-md-4">
                     <div class="service-item text-center">
-                        <div class="service-icon">
-                            <i class="fas fa-bullhorn"></i>
-                        </div>
+                        <div class="service-icon"><i class="fas fa-bullhorn"></i></div>
                         <h5>Marketing</h5>
                         <p>From campaigns to conversions, our marketing solutions help you reach and retain the right audience.</p>
                     </div>
                 </div>
                 <div class="col-md-4">
                     <div class="service-item text-center">
-                        <div class="service-icon">
-                            <i class="fas fa-microchip"></i>
-                        </div>
+                        <div class="service-icon"><i class="fas fa-microchip"></i></div>
                         <h5>Technology</h5>
                         <p>Cutting-edge tech solutions that power your digital infrastructure and streamline operations.</p>
                     </div>
                 </div>
                 <div class="col-md-4">
                     <div class="service-item text-center">
-                        <div class="service-icon">
-                            <i class="fas fa-shopping-bag"></i>
-                        </div>
+                        <div class="service-icon"><i class="fas fa-shopping-bag"></i></div>
                         <h5>Ecommerce</h5>
                         <p>End-to-end ecommerce development and optimization to boost your online sales and user experience.</p>
                     </div>
                 </div>
                 <div class="col-md-4">
                     <div class="service-item text-center">
-                        <div class="service-icon">
-                            <i class="fas fa-tag"></i>
-                        </div>
+                        <div class="service-icon"><i class="fas fa-tag"></i></div>
                         <h5>Branding</h5>
                         <p>We craft memorable brand identities that resonate with your target audience and build trust.</p>
                     </div>
                 </div>
                 <div class="col-md-4">
                     <div class="service-item text-center">
-                        <div class="service-icon">
-                            <i class="fas fa-search"></i>
-                        </div>
+                        <div class="service-icon"><i class="fas fa-search"></i></div>
                         <h5>SEO Identity</h5>
                         <p>Dominate search rankings and build a strong online identity with our proven SEO strategies.</p>
                     </div>
@@ -175,7 +154,7 @@
                         Our team of experts crafts comprehensive business strategies backed by real data.
                         We focus on delivering results that matter — growth, efficiency, and lasting impact.
                     </p>
-                    <a href="#contact" class="btn btn-outline-white">Start Now</a>
+                    <a href="#contact" class="btn-white-outline">Start Now</a>
                 </div>
                 <div class="col-lg-6">
                     <div class="cta-image-wrapper">
@@ -197,28 +176,28 @@
                             <div class="why-item">
                                 <span class="why-num">01.</span>
                                 <h5>Elegant / unique design</h5>
-                                <p>We create visually stunning designs that stand out and leave a lasting impression on your audience.</p>
+                                <p>We create visually stunning designs that stand out and leave a lasting impression.</p>
                             </div>
                         </div>
                         <div class="col-6">
                             <div class="why-item">
                                 <span class="why-num">02.</span>
                                 <h5>True responsiveness</h5>
-                                <p>Every project is built mobile-first, ensuring a seamless experience across all devices and screen sizes.</p>
+                                <p>Every project is built mobile-first, ensuring a seamless experience on all devices.</p>
                             </div>
                         </div>
                         <div class="col-6">
                             <div class="why-item">
                                 <span class="why-num">03.</span>
                                 <h5>Different layout type</h5>
-                                <p>Flexibility in layout options ensures your website reflects your brand's unique personality and goals.</p>
+                                <p>Flexible layout options ensure your website reflects your brand's unique personality.</p>
                             </div>
                         </div>
                         <div class="col-6">
                             <div class="why-item">
                                 <span class="why-num">04.</span>
                                 <h5>Make it simple</h5>
-                                <p>We believe in clean, intuitive interfaces that make navigation effortless and enjoyable for users.</p>
+                                <p>Clean, intuitive interfaces that make navigation effortless and enjoyable for users.</p>
                             </div>
                         </div>
                     </div>
@@ -229,7 +208,7 @@
                         With years of industry experience and a passionate team, we deliver solutions that
                         exceed expectations. Our commitment is to your success — from concept to launch and beyond.
                     </p>
-                    <p class="text-muted">
+                    <p class="text-muted mt-3">
                         We combine strategic thinking with creative execution to help businesses of all sizes
                         grow, scale, and thrive in the digital landscape.
                     </p>
@@ -240,61 +219,51 @@
 
     <!-- ===== PORTFOLIO SECTION ===== -->
     <section id="portfolio" class="portfolio-section">
-        <div class="container mb-4">
-            <div class="text-center portfolio-filters">
-                <button class="pf-btn active" data-filter="all">All</button>
-                <button class="pf-btn" data-filter="web">Web</button>
-                <button class="pf-btn" data-filter="design">Design</button>
-                <button class="pf-btn" data-filter="brand">Brand</button>
-                <button class="pf-btn" data-filter="photo">Photo</button>
-                <button class="pf-btn" data-filter="marketing">Marketing</button>
-            </div>
-        </div>
         <div class="container-fluid px-0">
-            <div class="row g-0" id="portfolioGrid">
-                <div class="col-6 col-md-3 portfolio-item" data-category="web">
+            <div class="row g-0">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1541534741688-6078c6bfb5c5?w=400&q=80" alt="Portfolio 1" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
                     </div>
                 </div>
-                <div class="col-6 col-md-3 portfolio-item" data-category="design">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1587614382346-4ec70e388b28?w=400&q=80" alt="Portfolio 2" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
                     </div>
                 </div>
-                <div class="col-6 col-md-3 portfolio-item" data-category="brand">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?w=400&q=80" alt="Portfolio 3" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
                     </div>
                 </div>
-                <div class="col-6 col-md-3 portfolio-item" data-category="photo">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1519682337058-a94d519337bc?w=400&q=80" alt="Portfolio 4" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
                     </div>
                 </div>
-                <div class="col-6 col-md-3 portfolio-item" data-category="marketing">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=400&q=80" alt="Portfolio 5" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
                     </div>
                 </div>
-                <div class="col-6 col-md-3 portfolio-item" data-category="web">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1545231027-637d2f6210f8?w=400&q=80" alt="Portfolio 6" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
                     </div>
                 </div>
-                <div class="col-6 col-md-3 portfolio-item" data-category="design">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?w=400&q=80" alt="Portfolio 7" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
                     </div>
                 </div>
-                <div class="col-6 col-md-3 portfolio-item" data-category="brand">
+                <div class="col-6 col-md-3">
                     <div class="port-img-wrap">
                         <img src="https://images.unsplash.com/photo-1603533952851-a09cc7f05cf3?w=400&q=80" alt="Portfolio 8" class="img-fluid">
                         <div class="port-overlay"><i class="fas fa-plus"></i></div>
@@ -314,11 +283,11 @@
                         Our track record speaks for itself. From startups to Fortune 500 companies,
                         we've helped thousands of businesses transform their digital presence and achieve remarkable growth.
                     </p>
-                    <a href="#about" class="btn btn-outline-dark">Learn More</a>
+                    <a href="#about" class="btn-dark-outline mt-3 d-inline-block">Learn More</a>
                 </div>
                 <div class="col-lg-6">
                     <div class="stats-img-wrap">
-                        <img src="https://images.unsplash.com/photo-1522071820081-009f0129c71c?w=600&q=80" alt="Our Team" class="img-fluid rounded shadow">
+                        <img src="https://images.unsplash.com/photo-1522071820081-009f0129c71c?w=600&q=80" alt="Our Team" class="img-fluid">
                         <div class="play-btn">
                             <i class="fas fa-play"></i>
                         </div>
@@ -328,7 +297,7 @@
         </div>
     </section>
 
-    <!-- ===== CLIENTS / LOGOS SECTION ===== -->
+    <!-- ===== CLIENTS SECTION ===== -->
     <section class="clients-section">
         <div class="container">
             <div class="row align-items-center g-5">
@@ -338,13 +307,10 @@
                             <span class="client-name">FASTCOMPANY</span>
                         </div>
                         <div class="col-6 col-md-3">
-                            <div class="client-logo-block">
-                                <span class="client-name-sm">SOUTHERN</span>
-                                <span class="client-name-sm">COMPANY</span>
-                            </div>
+                            <span class="client-name">SOUTHERN<br>COMPANY</span>
                         </div>
                         <div class="col-6 col-md-3">
-                            <span class="client-icon text-red"><i class="fas fa-shield-alt fa-2x"></i></span>
+                            <i class="fas fa-shield-alt fa-2x client-icon"></i>
                         </div>
                         <div class="col-6 col-md-3">
                             <span class="client-name">V&amp;IPS</span>
@@ -354,8 +320,8 @@
                 <div class="col-lg-4">
                     <h4 class="text-white">Clients with projects proudly crafted by our agency.</h4>
                     <p class="text-light-custom">
-                        We're proud to have worked with industry leaders across diverse sectors, delivering
-                        impactful results and building lasting partnerships.
+                        We're proud to have worked with industry leaders across diverse sectors,
+                        delivering impactful results and building lasting partnerships.
                     </p>
                 </div>
             </div>
@@ -412,25 +378,25 @@
                     <h2 class="contact-title">Want to have a proffesional project? Let's talk about it.</h2>
                 </div>
                 <div class="col-lg-7">
-                    <form id="contactForm">
+                    <form action="#" method="POST">
                         <div class="row g-3">
                             <div class="col-12">
-                                <input type="text" class="form-control contact-input" placeholder="Your name" required>
+                                <input type="text" class="contact-input" placeholder="Your name" name="name" required>
                             </div>
                             <div class="col-md-6">
-                                <input type="email" class="form-control contact-input" placeholder="Email address" required>
+                                <input type="email" class="contact-input" placeholder="Email address" name="email" required>
                             </div>
                             <div class="col-md-6">
-                                <input type="tel" class="form-control contact-input" placeholder="Enter contact">
+                                <input type="tel" class="contact-input" placeholder="Enter contact" name="phone">
                             </div>
                             <div class="col-12">
-                                <input type="text" class="form-control contact-input" placeholder="Subject">
+                                <input type="text" class="contact-input" placeholder="Subject" name="subject">
                             </div>
                             <div class="col-12">
-                                <textarea class="form-control contact-input" rows="5" placeholder="Your message here..."></textarea>
+                                <textarea class="contact-input contact-textarea" placeholder="Your message here..." name="message"></textarea>
                             </div>
                             <div class="col-12">
-                                <button type="submit" class="btn btn-red w-100">Submit</button>
+                                <button type="submit" class="btn-red-solid w-100">Submit</button>
                             </div>
                         </div>
                     </form>
@@ -443,7 +409,7 @@
     <footer class="footer-section">
         <div class="container">
             <div class="row g-5">
-                <!-- Brand + Info -->
+
                 <div class="col-lg-3 col-md-6">
                     <h3 class="footer-brand">Kallyas<span class="text-red">.</span></h3>
                     <p class="text-light-custom small">Your trusted partner for digital transformation and creative excellence.</p>
@@ -460,7 +426,6 @@
                     </div>
                 </div>
 
-                <!-- Nav Links -->
                 <div class="col-lg-2 col-md-6">
                     <h6 class="footer-heading">Home</h6>
                     <ul class="footer-links">
@@ -472,7 +437,6 @@
                     </ul>
                 </div>
 
-                <!-- Services Links -->
                 <div class="col-lg-2 col-md-6">
                     <h6 class="footer-heading">Services</h6>
                     <ul class="footer-links">
@@ -484,7 +448,6 @@
                     </ul>
                 </div>
 
-                <!-- Platform Links -->
                 <div class="col-lg-2 col-md-6">
                     <h6 class="footer-heading">Platform</h6>
                     <ul class="footer-links">
@@ -495,33 +458,27 @@
                     </ul>
                 </div>
 
-                <!-- Newsletter -->
                 <div class="col-lg-3 col-md-6">
                     <h6 class="footer-heading">Subscribe to newsletter</h6>
                     <p class="text-light-custom small">Stay updated with our latest news and offers.</p>
-                    <form class="mt-3" id="newsletterForm">
-                        <div class="input-group">
-                            <input type="email" class="form-control newsletter-input" placeholder="Email address" required>
-                            <button class="btn btn-red" type="submit">Submit</button>
+                    <form action="#" method="POST" class="mt-3">
+                        <div class="newsletter-wrap">
+                            <input type="email" class="newsletter-input" placeholder="Email address" name="email" required>
+                            <button type="submit" class="newsletter-btn">Submit</button>
                         </div>
                     </form>
                 </div>
+
             </div>
 
             <hr class="footer-divider mt-5">
-            <div class="row">
-                <div class="col-12 text-center">
-                    <p class="text-light-custom small mb-0">&copy; 2024 Kallyas. All rights reserved. Designed with <span class="text-red">&hearts;</span></p>
-                </div>
+            <div class="text-center">
+                <p class="text-light-custom small mb-0">&copy; 2024 Kallyas. All rights reserved.</p>
             </div>
         </div>
     </footer>
 
-    <!-- Bootstrap JS -->
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-
-    <!-- Custom Script -->
-    <script src="script.js"></script>
+    <!-- NO JavaScript - Pure Static HTML & CSS -->
 
 </body>
 </html>
