@@ -6,81 +6,97 @@
     <style>
       :root { color-scheme: dark; }
       html, body {
-        margin: 0; padding: 0; width: 320px;
+        margin: 0; padding: 0; width: 360px; max-height: 540px; overflow: hidden;
         background: #0b0d12; color: #e6e8ee;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
         font-size: 14px;
       }
-      .wrap { padding: 16px; }
-      .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; margin-bottom: 12px; }
+      .wrap { padding: 14px; }
+      .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; margin-bottom: 10px; }
       .dot { width: 10px; height: 10px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e80; }
-      .card { background: #12151c; border: 1px solid #222632; border-radius: 10px; padding: 12px; margin-bottom: 10px; }
-      .label { color: #8b93a7; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-      .value { font-weight: 600; margin-top: 2px; }
-      input {
-        display: block; width: 100%; box-sizing: border-box;
-        padding: 9px 10px; margin-top: 6px;
-        background: #171b24; color: #e6e8ee;
-        border: 1px solid #222632; border-radius: 8px;
-        font-size: 13px;
+
+      .summary {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px;
       }
-      input:focus { outline: none; border-color: #22c55e; }
-      button, .btn {
-        display: block; width: 100%; padding: 10px 12px;
-        border: none; border-radius: 8px; cursor: pointer;
-        font-weight: 600; font-size: 14px;
-        background: #22c55e; color: #0b0d12;
-        text-decoration: none; text-align: center;
-        box-sizing: border-box;
+      .stat {
+        background: #12151c; border: 1px solid #222632; border-radius: 10px; padding: 10px;
       }
-      button:hover, .btn:hover { background: #16a34a; }
-      button:disabled { background: #6b7280; cursor: not-allowed; }
-      .btn-secondary { background: #171b24; color: #e6e8ee; border: 1px solid #222632; }
-      .btn-link { background: none; color: #8b93a7; padding: 4px; font-weight: 400; font-size: 12px; }
-      .btn-link:hover { color: #e6e8ee; background: none; }
-      .row { display: flex; justify-content: space-between; align-items: center; }
+      .label { color: #8b93a7; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+      .value { font-weight: 700; margin-top: 2px; font-size: 18px; }
+
+      .list-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
       .muted { color: #8b93a7; font-size: 12px; }
-      .err  { color: #fca5a5; font-size: 12px; margin-top: 6px; }
-      .stack > * + * { margin-top: 8px; }
-      .hidden { display: none; }
+
+      .list { max-height: 300px; overflow-y: auto; padding-right: 2px; }
+      .list::-webkit-scrollbar { width: 6px; }
+      .list::-webkit-scrollbar-thumb { background: #2a2f3d; border-radius: 4px; }
+
+      .item {
+        display: flex; gap: 10px; align-items: center;
+        background: #12151c; border: 1px solid #222632; border-radius: 10px;
+        padding: 8px; margin-bottom: 6px;
+      }
+      .item img {
+        width: 44px; height: 44px; border-radius: 6px; object-fit: contain;
+        background: #fff; flex-shrink: 0;
+      }
+      .item .body { flex: 1; min-width: 0; }
+      .item .title {
+        font-size: 12.5px; font-weight: 600;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .item .meta { font-size: 11.5px; color: #8b93a7; margin-top: 2px; }
+      .item a { color: #22c55e; text-decoration: none; font-size: 11.5px; }
+      .item a:hover { text-decoration: underline; }
+      .remove {
+        background: none; border: none; color: #8b93a7; cursor: pointer; padding: 4px;
+      }
+      .remove:hover { color: #fca5a5; }
+
+      .actions { display: flex; gap: 8px; margin-top: 10px; }
+      .btn {
+        flex: 1; padding: 9px 10px; border: none; border-radius: 8px;
+        cursor: pointer; font-weight: 600; font-size: 13px;
+        background: #22c55e; color: #0b0d12; text-align: center;
+      }
+      .btn:hover { background: #16a34a; }
+      .btn-secondary { background: #171b24; color: #e6e8ee; border: 1px solid #222632; }
+      .btn-secondary:hover { background: #1f2530; }
+
+      .empty {
+        text-align: center; padding: 22px 10px; color: #8b93a7;
+        background: #12151c; border: 1px dashed #222632; border-radius: 10px;
+      }
     </style>
   </head>
   <body>
     <div class="wrap">
       <div class="brand"><span class="dot"></span> Droply</div>
 
-      <div id="logged-in" class="hidden stack">
-        <div class="card">
-          <div class="label">eBay Store</div>
-          <div class="value" id="ebay-username">—</div>
+      <div class="summary">
+        <div class="stat">
+          <div class="label">Saved today</div>
+          <div class="value" id="today-count">0</div>
         </div>
-        <div class="card">
-          <div class="row">
-            <div>
-              <div class="label">Imports today</div>
-              <div class="value" id="today-count">0</div>
-            </div>
-            <div class="muted" id="today-date"></div>
-          </div>
+        <div class="stat">
+          <div class="label">In library</div>
+          <div class="value" id="total-count">0</div>
         </div>
-        <a class="btn" id="dashboard-link" href="#" target="_blank">Open dashboard</a>
-        <button class="btn-secondary" id="logout-btn">Log out</button>
       </div>
 
-      <div id="logged-out" class="hidden stack">
-        <div class="card">
-          <div class="value">Sign in to Droply</div>
-          <div class="muted" style="margin-top: 4px;">
-            Use your Droply account to start importing Amazon products to eBay.
-          </div>
-          <form id="login-form" style="margin-top: 10px;">
-            <input id="email" type="email" placeholder="you@example.com" required autocomplete="username" />
-            <input id="password" type="password" placeholder="Password" required autocomplete="current-password" />
-            <div class="err hidden" id="err"></div>
-            <button id="login-btn" type="submit" style="margin-top: 10px;">Sign in</button>
-          </form>
-        </div>
-        <a class="btn-link" id="signup-link" href="#" target="_blank">Don't have an account? Sign up</a>
+      <div class="list-head">
+        <div class="muted">Recent imports</div>
+        <button id="export-btn" class="remove" title="Copy all as JSON">Copy JSON</button>
+      </div>
+
+      <div id="list" class="list"></div>
+      <div id="empty" class="empty" style="display:none;">
+        Visit any Amazon product page and click <b>Save product (Droply)</b>.
+      </div>
+
+      <div class="actions">
+        <button id="amazon-btn" class="btn">Open Amazon</button>
+        <button id="clear-btn" class="btn btn-secondary">Clear all</button>
       </div>
     </div>
     <script src="popup.js"></script>

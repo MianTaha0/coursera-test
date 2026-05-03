@@ -1,110 +1,120 @@
-// Droply popup — inline login + status. Reads/writes chrome.storage.local.
-const CONFIG = {
-  API_URL: "http://localhost:8000",
-  APP_URL: "http://localhost:3000",
-};
+// Droply popup — pure local storage. No backend, no login.
 
 const $ = (id) => document.getElementById(id);
-const show = (id) => $(id).classList.remove("hidden");
-const hide = (id) => $(id).classList.add("hidden");
+
+function fmtPrice(p, c) {
+  if (p == null) return "—";
+  try { return new Intl.NumberFormat("en-US", { style: "currency", currency: c || "USD" }).format(p); }
+  catch { return `${p}`; }
+}
 
 function render(state) {
-  if (state.token) {
-    show("logged-in"); hide("logged-out");
-    $("ebay-username").textContent = state.ebayUsername || "Not connected";
-    $("today-count").textContent = state.todayCount || 0;
-    $("today-date").textContent = state.todayDate || "";
-    $("dashboard-link").href = `${CONFIG.APP_URL}/dashboard`;
-  } else {
-    show("logged-out"); hide("logged-in");
-    $("signup-link").href = `${CONFIG.APP_URL}/signup`;
+  $("today-count").textContent = state.today;
+  $("total-count").textContent = state.imports.length;
+
+  const list = $("list");
+  list.innerHTML = "";
+  if (!state.imports.length) {
+    $("empty").style.display = "block";
+    return;
   }
-}
+  $("empty").style.display = "none";
 
-function showError(msg) {
-  const el = $("err");
-  el.textContent = msg;
-  el.classList.remove("hidden");
-}
+  for (const item of state.imports.slice(0, 30)) {
+    const row = document.createElement("div");
+    row.className = "item";
 
-async function refreshMe(token) {
-  try {
-    const r = await fetch(`${CONFIG.API_URL}/api/me`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return j.ebay_username || null;
-  } catch {
-    return null;
-  }
-}
+    const img = document.createElement("img");
+    img.src = (item.images && item.images[0]) || "";
+    img.alt = "";
+    row.appendChild(img);
 
-async function load() {
-  chrome.storage.local.get(
-    ["droply_token", "droply_ebay_username", "droply_today"],
-    async (res) => {
-      const today = new Date().toISOString().slice(0, 10);
-      const counter = res.droply_today && res.droply_today.date === today
-        ? res.droply_today
-        : { date: today, count: 0 };
+    const body = document.createElement("div");
+    body.className = "body";
 
-      let ebayUsername = res.droply_ebay_username || "";
-      if (res.droply_token) {
-        const fresh = await refreshMe(res.droply_token);
-        if (fresh) {
-          ebayUsername = fresh;
-          chrome.storage.local.set({ droply_ebay_username: ebayUsername });
-        }
-      }
-      render({
-        token: res.droply_token,
-        ebayUsername,
-        todayCount: counter.count,
-        todayDate: counter.date,
-      });
-    },
-  );
-}
+    const title = document.createElement("div");
+    title.className = "title";
+    title.title = item.title || item.asin;
+    title.textContent = item.title || item.asin;
+    body.appendChild(title);
 
-async function login(email, password) {
-  const btn = $("login-btn");
-  btn.disabled = true;
-  btn.textContent = "Signing in…";
-  $("err").classList.add("hidden");
-  try {
-    const r = await fetch(`${CONFIG.API_URL}/api/auth/extension`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      showError(j.detail || `Sign in failed (${r.status})`);
-      return;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `${fmtPrice(item.price, item.currency)} · ${item.asin}`;
+    body.appendChild(meta);
+
+    if (item.amazon_url) {
+      const link = document.createElement("a");
+      link.href = item.amazon_url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = "Open on Amazon";
+      body.appendChild(link);
     }
-    chrome.storage.local.set(
-      { droply_token: j.access_token },
-      () => load(),
-    );
-  } catch (e) {
-    showError(`Cannot reach Droply API at ${CONFIG.API_URL}`);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Sign in";
+
+    row.appendChild(body);
+
+    const remove = document.createElement("button");
+    remove.className = "remove";
+    remove.title = "Remove";
+    remove.textContent = "×";
+    remove.addEventListener("click", () => removeItem(item.asin));
+    row.appendChild(remove);
+
+    list.appendChild(row);
   }
+}
+
+function load() {
+  chrome.storage.local.get(["droply_imports", "droply_today"], (res) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const counter = res.droply_today && res.droply_today.date === today
+      ? res.droply_today
+      : { date: today, count: 0 };
+    render({
+      imports: Array.isArray(res.droply_imports) ? res.droply_imports : [],
+      today: counter.count,
+    });
+  });
+}
+
+function removeItem(asin) {
+  chrome.storage.local.get(["droply_imports"], (res) => {
+    const next = (res.droply_imports || []).filter((x) => x.asin !== asin);
+    chrome.storage.local.set({ droply_imports: next }, load);
+  });
+}
+
+function clearAll() {
+  if (!confirm("Clear all saved products?")) return;
+  chrome.storage.local.remove(["droply_imports"], load);
+}
+
+function copyJson() {
+  chrome.storage.local.get(["droply_imports"], (res) => {
+    const json = JSON.stringify(res.droply_imports || [], null, 2);
+    navigator.clipboard.writeText(json).then(
+      () => {
+        const btn = $("export-btn");
+        const old = btn.textContent;
+        btn.textContent = "Copied ✓";
+        setTimeout(() => (btn.textContent = old), 1500);
+      },
+      () => alert("Could not copy to clipboard"),
+    );
+  });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   load();
-  $("login-form")?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    login($("email").value.trim(), $("password").value);
+  $("clear-btn").addEventListener("click", clearAll);
+  $("export-btn").addEventListener("click", copyJson);
+  $("amazon-btn").addEventListener("click", () => {
+    chrome.tabs.create({ url: "https://www.amazon.com/" });
   });
-  $("logout-btn")?.addEventListener("click", () => {
-    chrome.storage.local.remove(
-      ["droply_token", "droply_ebay_username"],
-      () => load(),
-    );
+
+  // Live update if storage changes while popup is open.
+  chrome.storage.onChanged.addListener((_changes, area) => {
+    if (area === "local") load();
   });
 });

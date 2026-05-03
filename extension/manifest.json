@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Droply — Import to eBay",
+  "name": "Droply — Save Amazon products",
   "version": "1.0.0",
-  "description": "One-click import of Amazon products into your eBay store via Droply.",
-  "permissions": ["activeTab", "storage", "scripting"],
+  "description": "One-click capture of Amazon product data. Self-contained — saves to your browser, no account needed.",
+  "permissions": ["activeTab", "storage", "scripting", "tabs"],
   "host_permissions": [
     "https://www.amazon.com/*",
     "https://www.amazon.co.uk/*",
