@@ -112,6 +112,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("amazon-btn").addEventListener("click", () => {
     chrome.tabs.create({ url: "https://www.amazon.com/" });
   });
+  $("library-btn").addEventListener("click", () => {
+    chrome.tabs.create({ url: chrome.runtime.getURL("library.html") });
+  });
 
   // Live update if storage changes while popup is open.
   chrome.storage.onChanged.addListener((_changes, area) => {

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Droply — Library</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0; padding: 0; min-height: 100vh;
+        background: #0b0d12; color: #e6e8ee;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+        font-size: 14px;
+      }
+      a { color: inherit; }
+
+      header {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 16px; padding: 16px 24px;
+        border-bottom: 1px solid #222632; background: #12151c; position: sticky; top: 0; z-index: 10;
+      }
+      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
+      .dot { width: 12px; height: 12px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 10px #22c55e80; }
+      .toolbar { display: flex; gap: 10px; flex: 1; max-width: 720px; }
+      .search {
+        flex: 1; position: relative;
+      }
+      .search input {
+        width: 100%; padding: 9px 12px 9px 34px;
+        background: #171b24; color: #e6e8ee; border: 1px solid #222632; border-radius: 8px;
+        font-size: 14px;
+      }
+      .search input:focus { outline: none; border-color: #22c55e; }
+      .search::before {
+        content: "🔍"; position: absolute; left: 10px; top: 50%; transform: translateY(-50%); opacity: .6; font-size: 12px;
+      }
+      select {
+        padding: 9px 12px;
+        background: #171b24; color: #e6e8ee; border: 1px solid #222632; border-radius: 8px; font-size: 14px;
+      }
+      .actions { display: flex; gap: 8px; }
+      .btn {
+        padding: 9px 14px; border: none; border-radius: 8px;
+        cursor: pointer; font-weight: 600; font-size: 13px;
+        background: #22c55e; color: #0b0d12;
+      }
+      .btn:hover { background: #16a34a; }
+      .btn.secondary { background: #171b24; color: #e6e8ee; border: 1px solid #222632; }
+      .btn.secondary:hover { background: #1f2530; }
+      .btn.danger { background: #dc2626; color: #fff; }
+      .btn.danger:hover { background: #b91c1c; }
+
+      main { padding: 20px 24px 60px; max-width: 1400px; margin: 0 auto; }
+
+      .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+      @media (max-width: 720px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+      .stat {
+        background: #12151c; border: 1px solid #222632; border-radius: 12px; padding: 14px 16px;
+      }
+      .stat .label { color: #8b93a7; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+      .stat .value { font-weight: 700; font-size: 22px; margin-top: 4px; }
+
+      .grid {
+        display: grid; gap: 14px;
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      }
+      .card {
+        background: #12151c; border: 1px solid #222632; border-radius: 12px;
+        overflow: hidden; display: flex; flex-direction: column;
+        transition: border-color .15s, transform .15s;
+      }
+      .card:hover { border-color: #2a2f3d; transform: translateY(-1px); }
+      .thumb {
+        background: #fff; aspect-ratio: 1; display: flex; align-items: center; justify-content: center;
+      }
+      .thumb img { width: 100%; height: 100%; object-fit: contain; padding: 14px; }
+      .card .body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 6px; flex: 1; }
+      .card .title {
+        font-weight: 600; font-size: 13.5px; line-height: 1.35;
+        display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+      }
+      .card .meta { font-size: 12px; color: #8b93a7; display: flex; justify-content: space-between; }
+      .card .price { font-size: 16px; font-weight: 700; color: #e6e8ee; margin-top: 2px; }
+      .card .footer { display: flex; gap: 6px; margin-top: auto; padding-top: 8px; }
+      .card .footer a, .card .footer button {
+        flex: 1; text-align: center; padding: 7px 10px; border-radius: 6px; font-size: 12px;
+        text-decoration: none; cursor: pointer; border: 1px solid #222632; background: #171b24; color: #e6e8ee;
+      }
+      .card .footer a:hover, .card .footer button:hover { background: #1f2530; }
+      .card .footer .remove { color: #fca5a5; }
+      .card .footer .remove:hover { background: rgba(220,38,38,.15); border-color: rgba(220,38,38,.4); }
+
+      .badge {
+        display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 999px;
+        background: rgba(34,197,94,.15); color: #22c55e; font-weight: 600; text-transform: uppercase; letter-spacing: .03em;
+      }
+      .badge.out { background: rgba(220,38,38,.15); color: #fca5a5; }
+
+      .empty {
+        margin-top: 40px; padding: 60px 20px; text-align: center;
+        background: #12151c; border: 1px dashed #2a2f3d; border-radius: 12px; color: #8b93a7;
+      }
+      .empty h2 { color: #e6e8ee; margin: 0 0 8px; }
+
+      details {
+        margin-top: 20px; background: #12151c; border: 1px solid #222632; border-radius: 12px; padding: 12px 14px;
+      }
+      summary { cursor: pointer; color: #8b93a7; font-size: 12px; }
+      pre { white-space: pre-wrap; word-break: break-all; font-size: 11px; max-height: 320px; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand"><span class="dot"></span> Droply Library</div>
+      <div class="toolbar">
+        <div class="search"><input id="q" placeholder="Search title, brand, ASIN…" autofocus /></div>
+        <select id="sort">
+          <option value="recent">Recently saved</option>
+          <option value="price-asc">Price ↑</option>
+          <option value="price-desc">Price ↓</option>
+          <option value="title">Title A–Z</option>
+        </select>
+      </div>
+      <div class="actions">
+        <button class="btn secondary" id="export-csv">Export CSV</button>
+        <button class="btn secondary" id="export-json">Export JSON</button>
+        <button class="btn danger" id="clear">Clear all</button>
+      </div>
+    </header>
+
+    <main>
+      <div class="stats">
+        <div class="stat"><div class="label">Total products</div><div class="value" id="s-total">0</div></div>
+        <div class="stat"><div class="label">Saved today</div><div class="value" id="s-today">0</div></div>
+        <div class="stat"><div class="label">Avg price</div><div class="value" id="s-avg">—</div></div>
+        <div class="stat"><div class="label">In stock</div><div class="value" id="s-stock">0</div></div>
+      </div>
+
+      <div id="grid" class="grid"></div>
+      <div id="empty" class="empty" style="display:none;">
+        <h2>Nothing saved yet</h2>
+        <div>Visit any Amazon product page and click <b>Save product (Droply)</b>.</div>
+      </div>
+    </main>
+
+    <script src="library.js"></script>
+  </body>
+</html>
