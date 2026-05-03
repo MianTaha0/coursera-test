@@ -4,46 +4,43 @@
     <meta charset="utf-8" />
     <title>Droply</title>
     <style>
-      :root {
-        color-scheme: dark;
-      }
+      :root { color-scheme: dark; }
       html, body {
-        margin: 0;
-        padding: 0;
-        width: 320px;
-        background: #0b0d12;
-        color: #e6e8ee;
+        margin: 0; padding: 0; width: 320px;
+        background: #0b0d12; color: #e6e8ee;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
         font-size: 14px;
       }
       .wrap { padding: 16px; }
-      .brand {
-        display: flex; align-items: center; gap: 8px;
-        font-weight: 700; font-size: 16px; margin-bottom: 12px;
-      }
-      .dot {
-        width: 10px; height: 10px; border-radius: 50%;
-        background: #22c55e; box-shadow: 0 0 8px #22c55e80;
-      }
-      .card {
-        background: #12151c; border: 1px solid #222632;
-        border-radius: 10px; padding: 12px; margin-bottom: 10px;
-      }
+      .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; margin-bottom: 12px; }
+      .dot { width: 10px; height: 10px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e80; }
+      .card { background: #12151c; border: 1px solid #222632; border-radius: 10px; padding: 12px; margin-bottom: 10px; }
       .label { color: #8b93a7; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
       .value { font-weight: 600; margin-top: 2px; }
+      input {
+        display: block; width: 100%; box-sizing: border-box;
+        padding: 9px 10px; margin-top: 6px;
+        background: #171b24; color: #e6e8ee;
+        border: 1px solid #222632; border-radius: 8px;
+        font-size: 13px;
+      }
+      input:focus { outline: none; border-color: #22c55e; }
       button, .btn {
         display: block; width: 100%; padding: 10px 12px;
         border: none; border-radius: 8px; cursor: pointer;
         font-weight: 600; font-size: 14px;
         background: #22c55e; color: #0b0d12;
         text-decoration: none; text-align: center;
+        box-sizing: border-box;
       }
       button:hover, .btn:hover { background: #16a34a; }
-      .btn-secondary {
-        background: #171b24; color: #e6e8ee; border: 1px solid #222632;
-      }
+      button:disabled { background: #6b7280; cursor: not-allowed; }
+      .btn-secondary { background: #171b24; color: #e6e8ee; border: 1px solid #222632; }
+      .btn-link { background: none; color: #8b93a7; padding: 4px; font-weight: 400; font-size: 12px; }
+      .btn-link:hover { color: #e6e8ee; background: none; }
       .row { display: flex; justify-content: space-between; align-items: center; }
-      .muted { color: #8b93a7; }
+      .muted { color: #8b93a7; font-size: 12px; }
+      .err  { color: #fca5a5; font-size: 12px; margin-top: 6px; }
       .stack > * + * { margin-top: 8px; }
       .hidden { display: none; }
     </style>
@@ -66,18 +63,24 @@
             <div class="muted" id="today-date"></div>
           </div>
         </div>
-        <a class="btn" id="dashboard-link" href="#" target="_blank">Go to Dashboard</a>
+        <a class="btn" id="dashboard-link" href="#" target="_blank">Open dashboard</a>
         <button class="btn-secondary" id="logout-btn">Log out</button>
       </div>
 
       <div id="logged-out" class="hidden stack">
         <div class="card">
-          <div class="value">Not logged in</div>
+          <div class="value">Sign in to Droply</div>
           <div class="muted" style="margin-top: 4px;">
-            Log in to your Droply account to import Amazon products to eBay.
+            Use your Droply account to start importing Amazon products to eBay.
           </div>
+          <form id="login-form" style="margin-top: 10px;">
+            <input id="email" type="email" placeholder="you@example.com" required autocomplete="username" />
+            <input id="password" type="password" placeholder="Password" required autocomplete="current-password" />
+            <div class="err hidden" id="err"></div>
+            <button id="login-btn" type="submit" style="margin-top: 10px;">Sign in</button>
+          </form>
         </div>
-        <a class="btn" id="login-link" href="#" target="_blank">Log in to Droply</a>
+        <a class="btn-link" id="signup-link" href="#" target="_blank">Don't have an account? Sign up</a>
       </div>
     </div>
     <script src="popup.js"></script>
