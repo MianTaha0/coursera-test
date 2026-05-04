@@ -1,136 +1,86 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useSearchParams } from "next/navigation";
-import { Check, Chrome, Link as LinkIcon, Unplug } from "lucide-react";
-import { api } from "@/lib/api";
-import { date } from "@/lib/format";
-
-type Me = {
-  id: string;
-  email: string;
-  ebay_username: string | null;
-  ebay_connected: boolean;
-  profile: { plan: string; trial_ends_at: string | null } | null;
-};
+import { Chrome, Server, CheckCircle2, XCircle, Download } from "lucide-react";
+import { api, API_URL } from "@/lib/api";
 
 export default function SettingsPage() {
-  const params = useSearchParams();
-  const [me, setMe] = useState<Me | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
-
-  async function load() {
-    try {
-      const m = await api<Me>("/api/me");
-      setMe(m);
-    } catch (e: any) {
-      setErr(e.message || String(e));
-    }
-  }
+  const [apiOk, setApiOk] = useState<boolean | null>(null);
+  const [stats, setStats] = useState<{ total: number; saved_today: number } | null>(null);
 
   useEffect(() => {
-    load();
-    if (params.get("ebay") === "connected") {
-      setInfo("eBay account connected successfully.");
-    }
-  }, [params]);
-
-  async function connectEbay() {
-    try {
-      setBusy("ebay");
-      setErr(null);
-      const { url } = await api<{ url: string }>("/api/ebay/oauth/url");
-      window.location.href = url;
-    } catch (e: any) {
-      setErr(e.message || String(e));
-      setBusy(null);
-    }
-  }
-
-  async function disconnectEbay() {
-    if (!confirm("Disconnect your eBay store?")) return;
-    try {
-      setBusy("ebay");
-      await api("/api/ebay/disconnect", { method: "POST" });
-      await load();
-    } catch (e: any) {
-      setErr(e.message || String(e));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  function downloadExtension() {
-    // The /extension folder is shipped as a zip alongside this app.
-    window.location.href = "/extension/droply-extension.zip";
-  }
+    api<{ status: string }>("/health")
+      .then(() => setApiOk(true))
+      .catch(() => setApiOk(false));
+    api<{ total: number; saved_today: number }>("/api/stats")
+      .then((s) => setStats({ total: s.total, saved_today: s.saved_today }))
+      .catch(() => {});
+  }, []);
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Settings</h1>
-
-      {info && (
-        <div className="rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-sm text-accent">{info}</div>
-      )}
-      {err && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">{err}</div>
-      )}
-
-      <div className="card">
-        <h2 className="text-lg font-semibold">Account</h2>
-        <div className="mt-3 grid gap-4 sm:grid-cols-3">
-          <div>
-            <div className="text-xs uppercase text-muted">Email</div>
-            <div className="mt-1 font-medium">{me?.email || "—"}</div>
-          </div>
-          <div>
-            <div className="text-xs uppercase text-muted">Plan</div>
-            <div className="mt-1 font-medium capitalize">{me?.profile?.plan || "trial"}</div>
-          </div>
-          <div>
-            <div className="text-xs uppercase text-muted">Trial ends</div>
-            <div className="mt-1 font-medium">{date(me?.profile?.trial_ends_at)}</div>
-          </div>
-        </div>
+      <div>
+        <h1 className="text-2xl font-bold">Settings</h1>
+        <p className="text-sm text-muted">Configure how your dashboard talks to the Chrome extension.</p>
       </div>
 
       <div className="card">
-        <h2 className="text-lg font-semibold">eBay store</h2>
-        <p className="mt-1 text-sm text-muted">
-          Connect your eBay account so Droply can list, monitor, and message buyers on your behalf.
-        </p>
-        <div className="mt-4 flex flex-wrap items-center gap-3">
-          {me?.ebay_connected ? (
-            <>
-              <span className="badge bg-accent/15 text-accent">
-                <Check size={14} className="mr-1" /> Connected
-              </span>
-              <span className="text-sm">
-                Store: <span className="font-medium">{me.ebay_username || "(unknown)"}</span>
-              </span>
-              <button onClick={disconnectEbay} disabled={busy === "ebay"} className="btn-secondary">
-                <Unplug size={16} /> Disconnect
-              </button>
-            </>
-          ) : (
-            <button onClick={connectEbay} disabled={busy === "ebay"} className="btn-primary">
-              <LinkIcon size={16} /> Connect eBay store
-            </button>
-          )}
+        <div className="flex items-center gap-3">
+          <Server size={20} className="text-muted" />
+          <h2 className="text-lg font-semibold">Backend API</h2>
         </div>
+        <div className="mt-4 grid gap-4 sm:grid-cols-3">
+          <div>
+            <div className="text-xs uppercase text-muted">URL</div>
+            <div className="mt-1 font-mono text-sm">{API_URL}</div>
+          </div>
+          <div>
+            <div className="text-xs uppercase text-muted">Status</div>
+            <div className="mt-1 flex items-center gap-2">
+              {apiOk === null ? (
+                <span className="text-muted">Checking…</span>
+              ) : apiOk ? (
+                <span className="flex items-center gap-1 text-accent"><CheckCircle2 size={16} /> Online</span>
+              ) : (
+                <span className="flex items-center gap-1 text-red-400"><XCircle size={16} /> Unreachable</span>
+              )}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs uppercase text-muted">Synced products</div>
+            <div className="mt-1 font-medium">
+              {stats ? `${stats.total} total · ${stats.saved_today} today` : "—"}
+            </div>
+          </div>
+        </div>
+        <p className="mt-4 text-xs text-muted">
+          Change the URL by setting <code>NEXT_PUBLIC_API_URL</code> in <code>frontend/.env.local</code> and restarting the dev server.
+        </p>
       </div>
 
       <div className="card">
-        <h2 className="text-lg font-semibold">Chrome extension</h2>
-        <p className="mt-1 text-sm text-muted">
-          Install the Droply extension to add an "Import to eBay" button on every Amazon product page.
+        <div className="flex items-center gap-3">
+          <Chrome size={20} className="text-muted" />
+          <h2 className="text-lg font-semibold">Chrome extension</h2>
+        </div>
+        <p className="mt-2 text-sm text-muted">
+          Install the Droply extension to add a one-click "Save product" button on every Amazon product page.
+          Each save automatically syncs to this dashboard.
         </p>
+        <ol className="mt-4 list-decimal space-y-2 pl-5 text-sm text-white/90">
+          <li>Download the extension zip below and unzip it.</li>
+          <li>Open <code>chrome://extensions</code> and enable <b>Developer mode</b>.</li>
+          <li>Click <b>Load unpacked</b> and select the unzipped folder.</li>
+          <li>Open the extension popup → expand <b>Backend URL</b> → enter <code>{API_URL}</code> and click <b>Save</b>.</li>
+          <li>Visit any Amazon product page and click the green <b>Save product (Droply)</b> button.</li>
+        </ol>
         <div className="mt-4">
-          <button onClick={downloadExtension} className="btn-primary">
-            <Chrome size={16} /> Download extension (.zip)
-          </button>
+          <a
+            href="https://github.com/MianTaha0/coursera-test/raw/claude/droopify-clone-4wssG/extension/droply-extension.zip"
+            className="btn-primary"
+          >
+            <Download size={16} /> Download extension (.zip)
+          </a>
         </div>
       </div>
     </div>

@@ -1,21 +1,9 @@
 "use client";
 
+import { ExternalLink, Trash2 } from "lucide-react";
 import { useState } from "react";
-import { supabase } from "@/lib/supabase";
-import { money } from "@/lib/format";
-
-export type Product = {
-  id: string;
-  asin: string | null;
-  title: string | null;
-  images: string[] | null;
-  amazon_price: number | null;
-  ebay_price: number | null;
-  profit_margin: number | null;
-  stock_status: string;
-  monitor_status: string;
-  ebay_listing_url: string | null;
-};
+import { api, Product } from "@/lib/api";
+import { money, date } from "@/lib/format";
 
 export default function ProductsTable({
   products,
@@ -28,26 +16,21 @@ export default function ProductsTable({
 }) {
   const [busy, setBusy] = useState<string | null>(null);
 
-  async function toggleMonitor(p: Product) {
-    setBusy(p.id);
-    const next = p.monitor_status === "active" ? "paused" : "active";
-    await supabase().from("products").update({ monitor_status: next }).eq("id", p.id);
-    setBusy(null);
-    onChange?.();
-  }
-
   async function remove(p: Product) {
-    if (!confirm(`Remove "${p.title}" from your store?`)) return;
-    setBusy(p.id);
-    await supabase().from("products").delete().eq("id", p.id);
-    setBusy(null);
-    onChange?.();
+    if (!confirm(`Remove "${p.title || p.asin}" from the dashboard?`)) return;
+    setBusy(p.asin);
+    try {
+      await api(`/api/products/${encodeURIComponent(p.asin)}`, { method: "DELETE" });
+      onChange?.();
+    } finally {
+      setBusy(null);
+    }
   }
 
   if (!products.length) {
     return (
       <div className="card text-center text-muted">
-        No products yet. Use the Chrome extension on an Amazon product page to import one.
+        No products yet. Visit any Amazon product page and click <b>Save product (Droply)</b> in the Chrome extension.
       </div>
     );
   }
@@ -58,17 +41,16 @@ export default function ProductsTable({
         <thead className="bg-panel2">
           <tr>
             <th className="th">Product</th>
-            <th className="th">Amazon</th>
-            <th className="th">eBay</th>
-            <th className="th">Profit</th>
+            <th className="th">Brand</th>
+            <th className="th">Price</th>
             <th className="th">Stock</th>
-            {!compact && <th className="th">Monitor</th>}
-            {!compact && <th className="th text-right">Actions</th>}
+            {!compact && <th className="th">Saved</th>}
+            <th className="th text-right">Actions</th>
           </tr>
         </thead>
         <tbody>
           {products.map((p) => (
-            <tr key={p.id} className="border-t border-border">
+            <tr key={p.asin} className="border-t border-border">
               <td className="td">
                 <div className="flex items-center gap-3">
                   {p.images?.[0] && (
@@ -76,30 +58,20 @@ export default function ProductsTable({
                     <img
                       src={p.images[0]}
                       alt=""
-                      className="h-10 w-10 rounded border border-border bg-white object-contain"
+                      referrerPolicy="no-referrer"
+                      className="h-12 w-12 rounded border border-border bg-white object-contain"
                     />
                   )}
                   <div className="min-w-0">
-                    <div className="line-clamp-1 max-w-xs font-medium">
+                    <div className="line-clamp-1 max-w-md font-medium">
                       {p.title || p.asin}
                     </div>
-                    {p.ebay_listing_url ? (
-                      <a
-                        href={p.ebay_listing_url}
-                        target="_blank"
-                        className="text-xs text-accent hover:underline"
-                      >
-                        View on eBay
-                      </a>
-                    ) : (
-                      <div className="text-xs text-muted">Not listed</div>
-                    )}
+                    <div className="font-mono text-xs text-muted">{p.asin}</div>
                   </div>
                 </div>
               </td>
-              <td className="td">{money(p.amazon_price)}</td>
-              <td className="td">{money(p.ebay_price)}</td>
-              <td className="td text-accent">{money(p.profit_margin)}</td>
+              <td className="td">{p.brand || "—"}</td>
+              <td className="td font-medium">{money(p.price, p.currency)}</td>
               <td className="td">
                 <span
                   className={`badge ${
@@ -111,39 +83,30 @@ export default function ProductsTable({
                   {p.stock_status === "in_stock" ? "In stock" : "Out"}
                 </span>
               </td>
-              {!compact && (
-                <td className="td">
-                  <span
-                    className={`badge ${
-                      p.monitor_status === "active"
-                        ? "bg-blue-500/15 text-blue-300"
-                        : "bg-zinc-500/20 text-zinc-300"
-                    }`}
-                  >
-                    {p.monitor_status}
-                  </span>
-                </td>
-              )}
-              {!compact && (
-                <td className="td text-right">
-                  <div className="flex justify-end gap-2">
-                    <button
-                      disabled={busy === p.id}
-                      onClick={() => toggleMonitor(p)}
+              {!compact && <td className="td text-muted">{date(p.saved_at)}</td>}
+              <td className="td text-right">
+                <div className="flex justify-end gap-2">
+                  {p.amazon_url && (
+                    <a
+                      href={p.amazon_url}
+                      target="_blank"
+                      rel="noopener"
                       className="btn-secondary text-xs"
+                      title="View on Amazon"
                     >
-                      {p.monitor_status === "active" ? "Pause" : "Resume"}
-                    </button>
-                    <button
-                      disabled={busy === p.id}
-                      onClick={() => remove(p)}
-                      className="btn-danger text-xs"
-                    >
-                      Remove
-                    </button>
-                  </div>
-                </td>
-              )}
+                      <ExternalLink size={14} />
+                    </a>
+                  )}
+                  <button
+                    disabled={busy === p.asin}
+                    onClick={() => remove(p)}
+                    className="btn-danger text-xs"
+                    title="Remove"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </td>
             </tr>
           ))}
         </tbody>

@@ -96,11 +96,23 @@
 
       <div class="actions">
         <button id="library-btn" class="btn">Open library</button>
-        <button id="amazon-btn" class="btn btn-secondary">Open Amazon</button>
+        <button id="dashboard-btn" class="btn btn-secondary">Open dashboard</button>
       </div>
       <div class="actions" style="margin-top: 6px;">
+        <button id="amazon-btn" class="btn btn-secondary" style="flex: 1;">Open Amazon</button>
         <button id="clear-btn" class="btn btn-secondary" style="flex: 1;">Clear all</button>
       </div>
+
+      <details style="margin-top: 10px; background: #12151c; border: 1px solid #222632; border-radius: 8px; padding: 8px 10px;">
+        <summary style="color: #8b93a7; cursor: pointer; font-size: 12px;">Backend URL</summary>
+        <input
+          id="backend-url"
+          type="url"
+          placeholder="http://localhost:8000"
+          style="width: 100%; box-sizing: border-box; margin-top: 6px; padding: 7px 8px; background: #171b24; color: #e6e8ee; border: 1px solid #222632; border-radius: 6px; font-size: 12px;"
+        />
+        <button id="save-backend-btn" class="btn" style="width: 100%; margin-top: 6px; padding: 6px; font-size: 12px;">Save</button>
+      </details>
     </div>
     <script src="popup.js"></script>
   </body>

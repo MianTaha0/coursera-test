@@ -1,7 +1,10 @@
 // Droply — Amazon product scraper + "Save product" injector.
-// Self-contained: no backend, no login. Stores captured products in chrome.storage.local.
+// Stores captured products in chrome.storage.local (always) and best-effort
+// pushes them to the dashboard backend so the website can show them.
 (() => {
   const MAX_STORED = 200;
+  const BACKEND_URL_KEY = "droply_backend_url";
+  const DEFAULT_BACKEND = "http://localhost:8000";
 
   // ---------- DOM helpers ----------
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -119,11 +122,10 @@
   }
 
   // ---------- Save to chrome.storage.local ----------
-  function saveImport(item) {
+  function saveLocal(item) {
     return new Promise((resolve, reject) => {
       chrome.storage.local.get(["droply_imports", "droply_today"], (res) => {
         const imports = Array.isArray(res.droply_imports) ? res.droply_imports : [];
-        // Replace any earlier entry for the same ASIN, then prepend.
         const filtered = imports.filter((x) => x.asin !== item.asin);
         const next = [item, ...filtered].slice(0, MAX_STORED);
         const today = new Date().toISOString().slice(0, 10);
@@ -137,6 +139,36 @@
         });
       });
     });
+  }
+
+  // ---------- Best-effort push to backend ----------
+  function getBackendUrl() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get([BACKEND_URL_KEY], (res) => {
+        resolve(res[BACKEND_URL_KEY] || DEFAULT_BACKEND);
+      });
+    });
+  }
+
+  async function pushToBackend(item) {
+    const url = await getBackendUrl();
+    if (!url) return { ok: false, skipped: true };
+    try {
+      const r = await fetch(`${url}/api/products`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item),
+      });
+      return { ok: r.ok, status: r.status };
+    } catch (e) {
+      return { ok: false, error: String(e.message || e) };
+    }
+  }
+
+  async function saveImport(item) {
+    const total = await saveLocal(item);
+    const push = await pushToBackend(item);
+    return { total, push };
   }
 
   // ---------- Button injector ----------
@@ -187,8 +219,9 @@
       return;
     }
     try {
-      const total = await saveImport(data);
-      setBtnState(btn, "success", `Saved — ${total} in library`);
+      const { total, push } = await saveImport(data);
+      const suffix = push.ok ? " · synced" : " · local only";
+      setBtnState(btn, "success", `Saved — ${total} in library${suffix}`);
     } catch (e) {
       setBtnState(btn, "error", `Error: ${e.message || "save failed"}`);
     }

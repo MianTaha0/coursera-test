@@ -1,58 +1,120 @@
-"""Droply FastAPI app — entrypoint for all backend endpoints."""
+"""Droply backend — SQLite-backed, no auth, no Supabase.
+
+Endpoints used by the Chrome extension and the Next.js dashboard:
+  POST   /api/products              save / upsert one product (called by extension)
+  GET    /api/products              list all
+  GET    /api/products/{asin}       fetch one
+  DELETE /api/products/{asin}       remove one
+  POST   /api/products/bulk         upsert many (used by "Sync from extension")
+  DELETE /api/products              clear all
+  GET    /api/stats                 aggregate stats for dashboard
+  GET    /api/orders                list orders (empty until eBay flow is wired back)
+"""
 from __future__ import annotations
 
-import logging
-from contextlib import asynccontextmanager
-from typing import Optional
+import json
+import os
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, date, timezone
+from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import ebay as ebay_api
-from . import messages as messages_mod
-from . import orders as orders_mod
-from .database import admin_client, settings, verify_token
-from .monitor import start_scheduler, stop_scheduler
+DB_PATH = os.getenv("DROPLY_DB", os.path.join(os.path.dirname(__file__), "droply.db"))
 
-log = logging.getLogger("droply")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    start_scheduler()
-    yield
-    stop_scheduler()
-
-
-app = FastAPI(title="Droply API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Droply API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 # ---------------------------------------------------------------
-# Auth dependency
+# DB
 # ---------------------------------------------------------------
-def current_user(authorization: Optional[str] = Header(None)) -> dict:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.split(" ", 1)[1].strip()
-    user = verify_token(token)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    return user
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                asin TEXT PRIMARY KEY,
+                title TEXT,
+                brand TEXT,
+                price REAL,
+                currency TEXT,
+                images TEXT,
+                description TEXT,
+                stock_status TEXT,
+                amazon_url TEXT,
+                source_marketplace TEXT,
+                saved_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_asin TEXT,
+                buyer_name TEXT,
+                sale_price REAL,
+                amazon_cost REAL,
+                profit REAL,
+                status TEXT DEFAULT 'pending',
+                tracking_number TEXT,
+                created_at TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_products_saved_at ON products(saved_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+
+
+init_db()
+
+
+def row_to_product(r: sqlite3.Row) -> dict[str, Any]:
+    d = dict(r)
+    try:
+        d["images"] = json.loads(d.get("images") or "[]")
+    except Exception:
+        d["images"] = []
+    return d
 
 
 # ---------------------------------------------------------------
-# Health + meta
+# Schemas
+# ---------------------------------------------------------------
+class ProductIn(BaseModel):
+    asin: str
+    title: str = ""
+    brand: str = ""
+    price: Optional[float] = None
+    currency: str = "USD"
+    images: list[str] = Field(default_factory=list)
+    description: str = ""
+    stock_status: str = "in_stock"
+    amazon_url: str = ""
+    source_marketplace: str = ""
+    saved_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------
+# Routes
 # ---------------------------------------------------------------
 @app.get("/")
 def root():
@@ -64,156 +126,153 @@ def health():
     return {"status": "healthy"}
 
 
-@app.get("/api/me")
-def me(user=Depends(current_user)):
-    db = admin_client()
-    profile = db.table("users").select("*").eq("id", user["id"]).limit(1).execute().data
-    ebay = db.table("ebay_accounts").select("ebay_username, connected_at").eq("user_id", user["id"]).limit(1).execute().data
+def _upsert(conn: sqlite3.Connection, p: ProductIn) -> dict[str, Any]:
+    if not p.asin:
+        raise HTTPException(status_code=400, detail="asin required")
+    saved_at = p.saved_at or datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO products (asin, title, brand, price, currency, images, description,
+                              stock_status, amazon_url, source_marketplace, saved_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(asin) DO UPDATE SET
+            title=excluded.title,
+            brand=excluded.brand,
+            price=excluded.price,
+            currency=excluded.currency,
+            images=excluded.images,
+            description=excluded.description,
+            stock_status=excluded.stock_status,
+            amazon_url=excluded.amazon_url,
+            source_marketplace=excluded.source_marketplace,
+            saved_at=excluded.saved_at
+        """,
+        (
+            p.asin, p.title, p.brand, p.price, p.currency,
+            json.dumps(p.images), p.description, p.stock_status,
+            p.amazon_url, p.source_marketplace, saved_at,
+        ),
+    )
+    row = conn.execute("SELECT * FROM products WHERE asin = ?", (p.asin,)).fetchone()
+    return row_to_product(row)
+
+
+@app.post("/api/products")
+def save_product(payload: ProductIn):
+    with db() as conn:
+        return {"ok": True, "product": _upsert(conn, payload)}
+
+
+@app.post("/api/products/bulk")
+def save_products_bulk(payload: list[ProductIn]):
+    with db() as conn:
+        out = [_upsert(conn, p) for p in payload]
+    return {"ok": True, "count": len(out), "products": out}
+
+
+@app.get("/api/products")
+def list_products(q: Optional[str] = None, limit: int = 500):
+    with db() as conn:
+        if q:
+            like = f"%{q.lower()}%"
+            rows = conn.execute(
+                """
+                SELECT * FROM products
+                WHERE lower(title) LIKE ? OR lower(asin) LIKE ? OR lower(brand) LIKE ?
+                ORDER BY saved_at DESC LIMIT ?
+                """,
+                (like, like, like, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM products ORDER BY saved_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+    return [row_to_product(r) for r in rows]
+
+
+@app.get("/api/products/{asin}")
+def get_product(asin: str):
+    with db() as conn:
+        r = conn.execute("SELECT * FROM products WHERE asin = ?", (asin,)).fetchone()
+    if not r:
+        raise HTTPException(status_code=404, detail="not found")
+    return row_to_product(r)
+
+
+@app.delete("/api/products/{asin}")
+def delete_product(asin: str):
+    with db() as conn:
+        cur = conn.execute("DELETE FROM products WHERE asin = ?", (asin,))
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+@app.delete("/api/products")
+def clear_products():
+    with db() as conn:
+        cur = conn.execute("DELETE FROM products")
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+@app.get("/api/orders")
+def list_orders():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM orders ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/stats")
+def stats():
+    today = date.today().isoformat()
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
+        in_stock = conn.execute(
+            "SELECT COUNT(*) AS c FROM products WHERE stock_status = 'in_stock'"
+        ).fetchone()["c"]
+        out_of_stock = conn.execute(
+            "SELECT COUNT(*) AS c FROM products WHERE stock_status = 'out_of_stock'"
+        ).fetchone()["c"]
+        avg_row = conn.execute(
+            "SELECT AVG(price) AS a, SUM(price) AS s, MIN(price) AS lo, MAX(price) AS hi "
+            "FROM products WHERE price IS NOT NULL AND price > 0"
+        ).fetchone()
+        saved_today = conn.execute(
+            "SELECT COUNT(*) AS c FROM products WHERE substr(saved_at,1,10) = ?", (today,),
+        ).fetchone()["c"]
+        # Last 14 days saved count
+        rows = conn.execute(
+            """
+            SELECT substr(saved_at,1,10) AS day, COUNT(*) AS c
+            FROM products
+            GROUP BY day
+            ORDER BY day DESC
+            LIMIT 14
+            """
+        ).fetchall()
+        # Top brands
+        brands = conn.execute(
+            """
+            SELECT brand, COUNT(*) AS c FROM products
+            WHERE brand IS NOT NULL AND brand <> ''
+            GROUP BY brand ORDER BY c DESC LIMIT 6
+            """
+        ).fetchall()
+
+    by_day_map = {r["day"]: r["c"] for r in rows}
+    series = []
+    for i in range(13, -1, -1):
+        d = (datetime.utcnow().date().toordinal() - i)
+        d_str = date.fromordinal(d).isoformat()
+        series.append({"day": d_str[5:], "count": by_day_map.get(d_str, 0)})
+
     return {
-        "id": user["id"],
-        "email": user["email"],
-        "profile": profile[0] if profile else None,
-        "ebay_username": ebay[0]["ebay_username"] if ebay else None,
-        "ebay_connected": bool(ebay),
+        "total": total,
+        "in_stock": in_stock,
+        "out_of_stock": out_of_stock,
+        "saved_today": saved_today,
+        "avg_price": float(avg_row["a"] or 0),
+        "total_value": float(avg_row["s"] or 0),
+        "min_price": float(avg_row["lo"] or 0),
+        "max_price": float(avg_row["hi"] or 0),
+        "series": series,
+        "top_brands": [{"brand": b["brand"], "count": b["c"]} for b in brands],
     }
-
-
-# ---------------------------------------------------------------
-# Extension auth
-# ---------------------------------------------------------------
-class ExtensionLogin(BaseModel):
-    email: str
-    password: str
-
-
-@app.post("/api/auth/extension")
-def auth_extension(payload: ExtensionLogin):
-    """Validates email+password against Supabase Auth and returns a session token."""
-    from supabase import create_client
-
-    sb = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
-    try:
-        res = sb.auth.sign_in_with_password({"email": payload.email, "password": payload.password})
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Login failed: {e}")
-    if not res.session:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {
-        "access_token": res.session.access_token,
-        "refresh_token": res.session.refresh_token,
-        "user_id": res.user.id,
-        "email": res.user.email,
-    }
-
-
-# ---------------------------------------------------------------
-# Product import (called by Chrome extension)
-# ---------------------------------------------------------------
-class ImportProductIn(BaseModel):
-    asin: str
-    title: str = ""
-    price: Optional[float] = None
-    currency: Optional[str] = "USD"
-    images: list[str] = Field(default_factory=list)
-    description: Optional[str] = ""
-    stock_status: Optional[str] = "in_stock"
-    brand: Optional[str] = ""
-    amazon_url: Optional[str] = None
-    source_marketplace: Optional[str] = None
-
-
-@app.post("/api/import-product")
-def import_product(payload: ImportProductIn, user=Depends(current_user)):
-    if not payload.asin:
-        raise HTTPException(status_code=400, detail="ASIN missing")
-    if payload.price is None or payload.price <= 0:
-        raise HTTPException(status_code=400, detail="Could not read Amazon price")
-
-    db = admin_client()
-
-    # 1) Try to publish on eBay first; if that fails, still save the product as draft.
-    listing: Optional[dict] = None
-    listing_error: Optional[str] = None
-    try:
-        listing = ebay_api.create_listing(user["id"], payload.model_dump())
-    except Exception as e:
-        listing_error = str(e)
-        log.warning("eBay listing failed for user %s asin %s: %s", user["id"], payload.asin, e)
-
-    ebay_price = listing["ebay_price"] if listing else round(payload.price * (1 + settings.DEFAULT_MARKUP_PERCENT / 100.0), 2)
-    profit_margin = round(ebay_price - payload.price, 2)
-
-    row = {
-        "user_id": user["id"],
-        "asin": payload.asin,
-        "title": payload.title,
-        "images": payload.images,
-        "description": payload.description,
-        "brand": payload.brand,
-        "amazon_url": payload.amazon_url,
-        "amazon_price": payload.price,
-        "ebay_price": ebay_price,
-        "profit_margin": profit_margin,
-        "ebay_listing_id": listing["ebay_listing_id"] if listing else None,
-        "ebay_listing_url": listing["ebay_listing_url"] if listing else None,
-        "stock_status": payload.stock_status or "in_stock",
-        "monitor_status": "active",
-    }
-    res = db.table("products").upsert(row, on_conflict="user_id,asin").execute()
-
-    return {
-        "ok": True,
-        "product": (res.data or [row])[0],
-        "ebay_listing": listing,
-        "warning": listing_error,
-    }
-
-
-# ---------------------------------------------------------------
-# eBay OAuth
-# ---------------------------------------------------------------
-@app.get("/api/ebay/oauth/url")
-def ebay_oauth_url(user=Depends(current_user)):
-    return ebay_api.get_oauth_url(state=user["id"])
-
-
-@app.get("/api/ebay/oauth/callback")
-def ebay_oauth_callback(code: str, state: str):
-    """eBay redirects here after consent. `state` carries our user id."""
-    try:
-        result = ebay_api.handle_oauth_callback(code, state)
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-    return RedirectResponse(url=f"{settings.FRONTEND_URL}/settings?ebay=connected&user={result.get('ebay_username','')}")
-
-
-@app.post("/api/ebay/disconnect")
-def ebay_disconnect(user=Depends(current_user)):
-    ebay_api.disconnect(user["id"])
-    return {"ok": True}
-
-
-@app.get("/api/ebay/orders/sync")
-def ebay_orders_sync(user=Depends(current_user)):
-    return {"orders": ebay_api.get_orders(user["id"])}
-
-
-# ---------------------------------------------------------------
-# eBay order webhook + auto-fulfill
-# ---------------------------------------------------------------
-@app.post("/api/ebay/webhook")
-async def ebay_webhook(req: Request):
-    return await orders_mod.handle_webhook(req)
-
-
-# ---------------------------------------------------------------
-# Manual triggers (useful for testing)
-# ---------------------------------------------------------------
-@app.post("/api/orders/{order_id}/fulfill")
-def trigger_fulfill(order_id: str, user=Depends(current_user)):
-    return orders_mod.auto_fulfill_order(order_id, requester_id=user["id"])
-
-
-@app.post("/api/messages/{order_id}/{kind}")
-def trigger_message(order_id: str, kind: str, user=Depends(current_user)):
-    return messages_mod.send(kind, order_id, requester_id=user["id"])

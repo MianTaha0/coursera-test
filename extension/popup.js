@@ -1,5 +1,6 @@
-// Droply popup — pure local storage. No backend, no login.
+// Droply popup — local storage + optional backend.
 
+const DEFAULT_BACKEND = "http://localhost:8000";
 const $ = (id) => document.getElementById(id);
 
 function fmtPrice(p, c) {
@@ -66,16 +67,21 @@ function render(state) {
 }
 
 function load() {
-  chrome.storage.local.get(["droply_imports", "droply_today"], (res) => {
-    const today = new Date().toISOString().slice(0, 10);
-    const counter = res.droply_today && res.droply_today.date === today
-      ? res.droply_today
-      : { date: today, count: 0 };
-    render({
-      imports: Array.isArray(res.droply_imports) ? res.droply_imports : [],
-      today: counter.count,
-    });
-  });
+  chrome.storage.local.get(
+    ["droply_imports", "droply_today", "droply_backend_url"],
+    (res) => {
+      const today = new Date().toISOString().slice(0, 10);
+      const counter = res.droply_today && res.droply_today.date === today
+        ? res.droply_today
+        : { date: today, count: 0 };
+      render({
+        imports: Array.isArray(res.droply_imports) ? res.droply_imports : [],
+        today: counter.count,
+      });
+      $("backend-url").value = res.droply_backend_url || "";
+      $("backend-url").placeholder = DEFAULT_BACKEND;
+    },
+  );
 }
 
 function removeItem(asin) {
@@ -114,6 +120,21 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("library-btn").addEventListener("click", () => {
     chrome.tabs.create({ url: chrome.runtime.getURL("library.html") });
+  });
+  $("dashboard-btn").addEventListener("click", () => {
+    chrome.storage.local.get(["droply_backend_url"], (res) => {
+      const base = (res.droply_backend_url || DEFAULT_BACKEND).replace(/:\d+$/, ":3000").replace(/^https?:\/\/([^:/]+).*/, "http://$1:3000");
+      chrome.tabs.create({ url: base });
+    });
+  });
+  $("save-backend-btn").addEventListener("click", () => {
+    const v = $("backend-url").value.trim().replace(/\/+$/, "");
+    chrome.storage.local.set({ droply_backend_url: v }, () => {
+      const btn = $("save-backend-btn");
+      const old = btn.textContent;
+      btn.textContent = "Saved ✓";
+      setTimeout(() => (btn.textContent = old), 1200);
+    });
   });
 
   // Live update if storage changes while popup is open.
