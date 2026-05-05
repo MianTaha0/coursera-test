@@ -60,14 +60,14 @@ export default function ProductsTable({
     const block = buildClipboardBlock(p, lp);
     try {
       await navigator.clipboard.writeText(block);
-      flash("Title copied. Paste into eBay's title field.");
+      flash("Details copied. Find a similar item → 'Sell one like this'.");
     } catch {
       flash("Could not copy automatically — open the product page to copy.");
     }
-    // eBay's "Sell your item" search lookup. Pasting the title lets eBay match
-    // a catalog entry and prefill condition/specifics for a 1-click "List similar".
+    // eBay's catalog search. Pick any matching listing and click 'Sell one
+    // like this' on the right rail — eBay prefills 90% of the listing form.
     const q = encodeURIComponent((p.title || p.asin || "").slice(0, 80));
-    const url = `https://www.ebay.com/sl/sell?q=${q}`;
+    const url = `https://www.ebay.com/sch/i.html?_nkw=${q}&_sacat=0`;
     window.open(url, "_blank", "noopener");
   }
 
