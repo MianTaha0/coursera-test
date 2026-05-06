@@ -27,8 +27,22 @@
   }
   function parsePrice(str) {
     if (!str) return null;
-    const cleaned = str.replace(/[^\d.,]/g, "").replace(/\.(?=\d{3}\b)/g, "");
-    const n = parseFloat(cleaned.replace(",", "."));
+    let s = str.replace(/[^\d.,]/g, "");
+    if (!s) return null;
+    const lastComma = s.lastIndexOf(",");
+    const lastDot = s.lastIndexOf(".");
+    if (lastComma > -1 && lastDot > -1) {
+      // Whichever appears last is the decimal separator.
+      if (lastComma > lastDot) {
+        s = s.replace(/\./g, "").replace(",", "."); // EU: 1.234,56
+      } else {
+        s = s.replace(/,/g, "");                    // US: 1,234.56
+      }
+    } else if (lastComma > -1) {
+      const after = s.length - lastComma - 1;
+      s = after === 2 ? s.replace(",", ".") : s.replace(/,/g, "");
+    }
+    const n = parseFloat(s);
     return isFinite(n) ? n : null;
   }
   function extractPrice() {
@@ -57,12 +71,31 @@
     return null;
   }
   function extractCurrency() {
-    const sym = text($(".a-price-symbol"));
-    const map = { "$": "USD", "£": "GBP", "€": "EUR" };
-    if (map[sym]) return map[sym];
+    // 1) Read the price-symbol element. May be "$", "£", "€", or a 3-letter
+    //    code like "PKR" / "CAD" / "JPY" when Amazon shows a localized price
+    //    for a non-default delivery destination.
+    const symEl = text($(".a-price-symbol"));
+    const symMap = {
+      "$": "USD", "£": "GBP", "€": "EUR", "¥": "JPY",
+      "₹": "INR", "₽": "RUB", "₩": "KRW", "₺": "TRY",
+      "R$": "BRL", "kr": "SEK", "zł": "PLN", "Kč": "CZK",
+    };
+    if (symMap[symEl]) return symMap[symEl];
+    // 3-letter ISO code (PKR, CAD, AUD, MXN, AED, SAR, ...)
+    const iso = symEl.match(/^[A-Z]{3}$/);
+    if (iso) return iso[0];
+
+    // 2) Scan the visible price text for a leading 3-letter currency code.
+    const priceText = text($(".a-price .a-offscreen")) || text($(".a-price"));
+    const m = priceText.match(/\b([A-Z]{3})\b/);
+    if (m) return m[1];
+
+    // 3) Hostname-based fallbacks.
     if (location.hostname.endsWith(".co.uk")) return "GBP";
+    if (location.hostname.endsWith(".de") || location.hostname.endsWith(".fr") ||
+        location.hostname.endsWith(".it") || location.hostname.endsWith(".es")) return "EUR";
     if (location.hostname.endsWith(".com")) return "USD";
-    return "EUR";
+    return "USD";
   }
   function extractImages() {
     const urls = new Set();
