@@ -85,6 +85,17 @@ export type Alert = {
   stock_delta: string | null;
 };
 
+export type MessageTemplate = {
+  id: number;
+  slug: string;
+  name: string;
+  kind: string;
+  subject: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type AppSettings = {
   auto_reprice_enabled: boolean;
   markup_percent: number;

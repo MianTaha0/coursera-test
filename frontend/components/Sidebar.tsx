@@ -5,6 +5,7 @@ import {
   Package,
   ShoppingCart,
   Settings,
+  MessageSquare,
   Menu,
   X,
 } from "lucide-react";
@@ -16,6 +17,7 @@ const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/products", label: "Products", icon: Package },
   { href: "/orders", label: "Orders", icon: ShoppingCart },
+  { href: "/messages", label: "Messages", icon: MessageSquare },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

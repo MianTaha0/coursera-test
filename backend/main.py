@@ -75,6 +75,65 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Default message templates (seeded on first launch into message_templates)
+#   Variables supported: {buyer_name} {item_title} {order_id}
+#                        {tracking_number} {carrier} {seller_name}
+#                        {est_delivery_date}
+# ---------------------------------------------------------------------------
+DEFAULT_MESSAGE_TEMPLATES: list[tuple[str, str, str, str, str]] = [
+    (
+        "order_confirmed",
+        "Order confirmed",
+        "order_confirmed",
+        "Thanks for your order — {item_title}",
+        "Hi {buyer_name},\n\n"
+        "Thanks so much for your order! I've received your purchase of "
+        "\"{item_title}\" (order #{order_id}) and will get it shipped out shortly.\n\n"
+        "I'll send tracking information as soon as the package is on its way.\n\n"
+        "Thanks again,\n{seller_name}",
+    ),
+    (
+        "shipped",
+        "Shipped + tracking",
+        "shipped",
+        "Your order has shipped — {item_title}",
+        "Hi {buyer_name},\n\n"
+        "Good news — your order has shipped!\n\n"
+        "  Item: {item_title}\n"
+        "  Order: #{order_id}\n"
+        "  Carrier: {carrier}\n"
+        "  Tracking: {tracking_number}\n"
+        "  Estimated delivery: {est_delivery_date}\n\n"
+        "Thanks again for your order,\n{seller_name}",
+    ),
+    (
+        "delivered",
+        "Delivered check-in",
+        "delivered",
+        "Hope you're enjoying your purchase",
+        "Hi {buyer_name},\n\n"
+        "Tracking shows your order #{order_id} (\"{item_title}\") was delivered. "
+        "I hope it arrived in great shape and meets your expectations!\n\n"
+        "If anything's off, please reply to this message before leaving feedback "
+        "and I'll make it right.\n\n"
+        "Thanks,\n{seller_name}",
+    ),
+    (
+        "feedback_request",
+        "Feedback request",
+        "feedback_request",
+        "Quick favor? — {item_title}",
+        "Hi {buyer_name},\n\n"
+        "Thanks again for your purchase of \"{item_title}\"! If you've got a moment, "
+        "I'd really appreciate a positive feedback rating — it makes a huge "
+        "difference for a small seller.\n\n"
+        "If anything wasn't perfect, please reply first so I can fix it.\n\n"
+        "Thanks,\n{seller_name}",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # DB
 # ---------------------------------------------------------------------------
 @contextmanager
@@ -143,6 +202,31 @@ def init_db() -> None:
                 value TEXT
             )
         """)
+
+        # Buyer-message templates
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        # Seed defaults if the table is empty
+        existing = conn.execute("SELECT COUNT(*) AS c FROM message_templates").fetchone()["c"]
+        if existing == 0:
+            now = datetime.now(timezone.utc).isoformat()
+            for slug, name, kind, subject, body in DEFAULT_MESSAGE_TEMPLATES:
+                conn.execute(
+                    """INSERT INTO message_templates
+                       (slug, name, kind, subject, body, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (slug, name, kind, subject, body, now, now),
+                )
 
         # Price/stock snapshots — one row per change, never updated
         conn.execute("""
@@ -1077,6 +1161,104 @@ def api_update_settings(payload: SettingsIn):
     if payload.min_reprice_change_percent is not None:
         set_setting("min_reprice_change_percent", str(payload.min_reprice_change_percent))
     return api_get_settings()
+
+
+# ---------------------------------------------------------------------------
+# Routes — buyer-message templates
+# ---------------------------------------------------------------------------
+class TemplateIn(BaseModel):
+    slug: Optional[str] = None
+    name: str
+    kind: str = "custom"
+    subject: str
+    body: str
+
+
+def _row_to_template(r: sqlite3.Row) -> dict[str, Any]:
+    return dict(r)
+
+
+def _slugify(s: str) -> str:
+    out = "".join(c if c.isalnum() else "_" for c in s.strip().lower())
+    return "_".join(filter(None, out.split("_")))[:60] or "template"
+
+
+@app.get("/api/message-templates")
+def list_templates():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM message_templates ORDER BY id ASC"
+        ).fetchall()
+    return [_row_to_template(r) for r in rows]
+
+
+@app.post("/api/message-templates")
+def create_template(payload: TemplateIn):
+    now = datetime.now(timezone.utc).isoformat()
+    slug = payload.slug or _slugify(payload.name)
+    with db() as conn:
+        # Ensure unique slug
+        base, n = slug, 2
+        while conn.execute("SELECT 1 FROM message_templates WHERE slug = ?", (slug,)).fetchone():
+            slug = f"{base}_{n}"
+            n += 1
+        cur = conn.execute(
+            """INSERT INTO message_templates (slug, name, kind, subject, body, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (slug, payload.name, payload.kind, payload.subject, payload.body, now, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM message_templates WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return _row_to_template(row)
+
+
+@app.put("/api/message-templates/{template_id}")
+def update_template(template_id: int, payload: TemplateIn):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM message_templates WHERE id = ?", (template_id,)).fetchone():
+            raise HTTPException(404, "template not found")
+        conn.execute(
+            """UPDATE message_templates SET name=?, kind=?, subject=?, body=?, updated_at=?
+               WHERE id=?""",
+            (payload.name, payload.kind, payload.subject, payload.body, now, template_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM message_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+    return _row_to_template(row)
+
+
+@app.delete("/api/message-templates/{template_id}")
+def delete_template(template_id: int):
+    with db() as conn:
+        cur = conn.execute("DELETE FROM message_templates WHERE id = ?", (template_id,))
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+class RenderIn(BaseModel):
+    variables: dict[str, str] = Field(default_factory=dict)
+
+
+@app.post("/api/message-templates/{template_id}/render")
+def render_template(template_id: int, payload: RenderIn):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM message_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "template not found")
+
+    def safe_sub(text: str) -> str:
+        for key, value in payload.variables.items():
+            text = text.replace("{" + key + "}", str(value))
+        return text
+
+    return {
+        "subject": safe_sub(row["subject"]),
+        "body": safe_sub(row["body"]),
+    }
 
 
 @app.get("/api/listings")
