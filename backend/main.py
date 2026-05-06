@@ -34,7 +34,7 @@ from typing import Any, Optional
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
@@ -118,6 +118,32 @@ def init_db() -> None:
                 created_at TEXT
             )
         """)
+        # Active eBay listings (one row per ASIN/marketplace pair)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ebay_listings (
+                asin TEXT NOT NULL,
+                marketplace_id TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                offer_id TEXT,
+                listing_id TEXT,
+                listing_url TEXT,
+                last_price REAL,
+                currency TEXT,
+                markup_percent REAL,
+                listed_at TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (asin, marketplace_id)
+            )
+        """)
+
+        # Simple key/value config store
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
         # Price/stock snapshots — one row per change, never updated
         conn.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
@@ -213,6 +239,141 @@ async def _refresh_access_token(refresh_token: str) -> dict:
     if r.status_code != 200:
         raise HTTPException(502, f"eBay token refresh failed: {r.text}")
     return r.json()
+
+
+# ---------------------------------------------------------------------------
+# Helpers — settings (key/value)
+# ---------------------------------------------------------------------------
+DEFAULT_SETTINGS = {
+    "auto_reprice_enabled": "false",
+    "markup_percent": "30",
+    "min_reprice_change_percent": "1.0",
+}
+
+
+def get_settings_dict() -> dict[str, str]:
+    with db() as conn:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    out = dict(DEFAULT_SETTINGS)
+    out.update({r["key"]: r["value"] for r in rows})
+    return out
+
+
+def set_setting(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers — eBay listings persistence + auto-reprice
+# ---------------------------------------------------------------------------
+def save_listing(
+    *, asin: str, marketplace_id: str, sku: str, offer_id: str,
+    listing_id: str, listing_url: str, price: float, currency: str,
+    markup_percent: float,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO ebay_listings (asin, marketplace_id, sku, offer_id, listing_id,
+                                       listing_url, last_price, currency, markup_percent,
+                                       listed_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(asin, marketplace_id) DO UPDATE SET
+                sku=excluded.sku,
+                offer_id=excluded.offer_id,
+                listing_id=excluded.listing_id,
+                listing_url=excluded.listing_url,
+                last_price=excluded.last_price,
+                currency=excluded.currency,
+                markup_percent=excluded.markup_percent,
+                updated_at=excluded.updated_at
+            """,
+            (asin, marketplace_id, sku, offer_id, listing_id, listing_url,
+             price, currency, markup_percent, now, now),
+        )
+
+
+async def update_offer_price(offer_id: str, price: float, currency: str, marketplace_id: str) -> bool:
+    """Push a new price to an existing eBay offer. Republishes so it goes live."""
+    token = await get_valid_token()
+    content_language = "en-US" if marketplace_id == "EBAY_US" else "en-GB"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept-Language": content_language,
+        "Content-Language": content_language,
+        "X-EBAY-C-MARKETPLACE-ID": marketplace_id,
+    }
+    async with httpx.AsyncClient() as client:
+        # Fetch the current offer, patch the price, PUT it back
+        rg = await client.get(f"{EBAY_API_BASE}/sell/inventory/v1/offer/{offer_id}", headers=headers)
+        if rg.status_code != 200:
+            return False
+        offer = rg.json()
+        offer["pricingSummary"] = {"price": {"currency": currency, "value": str(price)}}
+        # PUT requires a complete payload; strip read-only / status fields
+        for k in ("listing", "status", "offerId", "listingDuration"):
+            offer.pop(k, None)
+        rp = await client.put(
+            f"{EBAY_API_BASE}/sell/inventory/v1/offer/{offer_id}",
+            headers=headers, json=offer,
+        )
+        if rp.status_code not in (200, 204):
+            return False
+        # Re-publish (needed for the price change to go live on a published offer)
+        rpub = await client.post(
+            f"{EBAY_API_BASE}/sell/inventory/v1/offer/{offer_id}/publish",
+            headers=headers,
+        )
+        return rpub.status_code in (200, 201)
+
+
+async def maybe_auto_reprice(asin: str, new_amazon_price: Optional[float]) -> None:
+    """Called after a product upsert. Re-prices the eBay listing if enabled."""
+    if new_amazon_price is None or new_amazon_price <= 0:
+        return
+    cfg = get_settings_dict()
+    if cfg.get("auto_reprice_enabled", "false").lower() != "true":
+        return
+    with db() as conn:
+        listing = conn.execute(
+            "SELECT * FROM ebay_listings WHERE asin = ?", (asin,)
+        ).fetchone()
+    if not listing or not listing["offer_id"]:
+        return
+
+    markup = float(listing["markup_percent"] or cfg.get("markup_percent") or 30)
+    min_change_pct = float(cfg.get("min_reprice_change_percent") or 1.0)
+    new_listing_price = round(new_amazon_price * (1 + markup / 100), 2)
+    old_listing_price = float(listing["last_price"] or 0)
+
+    if old_listing_price > 0:
+        change_pct = abs(new_listing_price - old_listing_price) / old_listing_price * 100
+        if change_pct < min_change_pct:
+            return
+    if new_listing_price == old_listing_price:
+        return
+
+    ok = await update_offer_price(
+        offer_id=listing["offer_id"],
+        price=new_listing_price,
+        currency=listing["currency"] or "USD",
+        marketplace_id=listing["marketplace_id"],
+    )
+    if ok:
+        with db() as conn:
+            conn.execute(
+                "UPDATE ebay_listings SET last_price = ?, updated_at = ? "
+                "WHERE asin = ? AND marketplace_id = ?",
+                (new_listing_price, datetime.now(timezone.utc).isoformat(),
+                 asin, listing["marketplace_id"]),
+            )
 
 
 async def ensure_business_policies(headers: dict, marketplace_id: str) -> dict:
@@ -659,6 +820,26 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         if EBAY_SANDBOX
         else f"https://www.ebay.com/itm/{listing_id}"
     )
+
+    # Persist the listing so auto-reprice + UI badges can find it
+    markup_pct = 0.0
+    if product.get("price"):
+        try:
+            markup_pct = round((listing_price / float(product["price"]) - 1) * 100, 2)
+        except Exception:
+            markup_pct = 0.0
+    save_listing(
+        asin=asin,
+        marketplace_id=body.marketplace_id,
+        sku=sku,
+        offer_id=offer_id,
+        listing_id=listing_id,
+        listing_url=ebay_url,
+        price=listing_price,
+        currency=(product.get("currency") or "USD"),
+        markup_percent=markup_pct,
+    )
+
     return {
         "ok": True,
         "sku": sku,
@@ -717,15 +898,28 @@ def _upsert(conn: sqlite3.Connection, p: ProductIn) -> dict[str, Any]:
 
 
 @app.post("/api/products")
-def save_product(payload: ProductIn):
+def save_product(payload: ProductIn, background: BackgroundTasks):
     with db() as conn:
-        return {"ok": True, "product": _upsert(conn, payload)}
+        prev = conn.execute(
+            "SELECT price FROM products WHERE asin = ?", (payload.asin,)
+        ).fetchone()
+        prev_price = prev["price"] if prev else None
+        product = _upsert(conn, payload)
+    if payload.price is not None and prev_price != payload.price:
+        background.add_task(maybe_auto_reprice, payload.asin, payload.price)
+    return {"ok": True, "product": product}
 
 
 @app.post("/api/products/bulk")
-def save_products_bulk(payload: list[ProductIn]):
+def save_products_bulk(payload: list[ProductIn], background: BackgroundTasks):
+    out = []
     with db() as conn:
-        out = [_upsert(conn, p) for p in payload]
+        for p in payload:
+            prev = conn.execute("SELECT price FROM products WHERE asin = ?", (p.asin,)).fetchone()
+            prev_price = prev["price"] if prev else None
+            out.append(_upsert(conn, p))
+            if p.price is not None and prev_price != p.price:
+                background.add_task(maybe_auto_reprice, p.asin, p.price)
     return {"ok": True, "count": len(out), "products": out}
 
 
@@ -858,6 +1052,42 @@ def clear_products():
 # ---------------------------------------------------------------------------
 # Routes — orders
 # ---------------------------------------------------------------------------
+@app.get("/api/settings")
+def api_get_settings():
+    s = get_settings_dict()
+    return {
+        "auto_reprice_enabled": s["auto_reprice_enabled"].lower() == "true",
+        "markup_percent": float(s["markup_percent"]),
+        "min_reprice_change_percent": float(s["min_reprice_change_percent"]),
+    }
+
+
+class SettingsIn(BaseModel):
+    auto_reprice_enabled: Optional[bool] = None
+    markup_percent: Optional[float] = None
+    min_reprice_change_percent: Optional[float] = None
+
+
+@app.put("/api/settings")
+def api_update_settings(payload: SettingsIn):
+    if payload.auto_reprice_enabled is not None:
+        set_setting("auto_reprice_enabled", "true" if payload.auto_reprice_enabled else "false")
+    if payload.markup_percent is not None:
+        set_setting("markup_percent", str(payload.markup_percent))
+    if payload.min_reprice_change_percent is not None:
+        set_setting("min_reprice_change_percent", str(payload.min_reprice_change_percent))
+    return api_get_settings()
+
+
+@app.get("/api/listings")
+def api_listings():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ebay_listings ORDER BY updated_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 @app.get("/api/orders")
 def list_orders():
     with db() as conn:

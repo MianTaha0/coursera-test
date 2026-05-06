@@ -2,7 +2,7 @@
 
 import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api, Product } from "@/lib/api";
+import { api, EbayListing, Product } from "@/lib/api";
 import { money, date } from "@/lib/format";
 import PriceHistoryModal from "./PriceHistoryModal";
 
@@ -40,13 +40,25 @@ export default function ProductsTable({
   const [toast, setToast] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
   const [ebayConnected, setEbayConnected] = useState(false);
   const [historyProduct, setHistoryProduct] = useState<Product | null>(null);
-  // track which ASINs have been listed this session
-  const [listed, setListed] = useState<Record<string, string>>({});
+  // ASIN → listing record (persisted server-side)
+  const [listings, setListings] = useState<Record<string, EbayListing>>({});
+
+  async function loadListings() {
+    try {
+      const arr = await api<EbayListing[]>("/api/listings");
+      const map: Record<string, EbayListing> = {};
+      for (const l of arr) map[l.asin] = l;
+      setListings(map);
+    } catch {
+      /* ignore */
+    }
+  }
 
   useEffect(() => {
     api<{ connected: boolean }>("/auth/ebay/status")
       .then((s) => setEbayConnected(s.connected))
       .catch(() => {});
+    loadListings();
   }, []);
 
   function flash(msg: string, type: "ok" | "err" = "ok") {
@@ -73,8 +85,8 @@ export default function ProductsTable({
         `/api/products/${encodeURIComponent(p.asin)}/list-ebay`,
         { method: "POST", body: JSON.stringify({}) }
       );
-      setListed((prev) => ({ ...prev, [p.asin]: result.listing_url }));
-      flash(`Listed on eBay at $${result.listing_price} — opening listing…`, "ok");
+      flash(`Listed on eBay at ${money(result.listing_price, p.currency)} — opening listing…`, "ok");
+      await loadListings();
       window.open(result.listing_url, "_blank", "noopener");
     } catch (e: any) {
       flash(e.message || "eBay listing failed.", "err");
@@ -122,7 +134,7 @@ export default function ProductsTable({
           <tbody>
             {products.map((p) => {
               const lp = ebayPrice(p.price);
-              const listingUrl = listed[p.asin];
+              const listing = listings[p.asin];
               const isBusy = busy === p.asin;
               return (
                 <tr key={p.asin} className="border-t border-border">
@@ -162,15 +174,16 @@ export default function ProductsTable({
                   {!compact && <td className="td text-muted">{date(p.saved_at)}</td>}
                   <td className="td text-right">
                     <div className="flex justify-end gap-2">
-                      {listingUrl ? (
+                      {listing?.listing_url ? (
                         <a
-                          href={listingUrl}
+                          href={listing.listing_url}
                           target="_blank"
                           rel="noopener"
                           className="btn-primary text-xs"
-                          title="View eBay listing"
+                          title={`Listed on eBay at ${money(listing.last_price, listing.currency || p.currency)}`}
                         >
-                          <CheckCircle2 size={14} /> Listed
+                          <CheckCircle2 size={14} />
+                          Listed @ {money(listing.last_price, listing.currency || p.currency)}
                         </a>
                       ) : (
                         <button

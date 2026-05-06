@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle } from "lucide-react";
-import { api, API_URL } from "@/lib/api";
+import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle, RefreshCw } from "lucide-react";
+import { api, API_URL, AppSettings } from "@/lib/api";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 
@@ -128,6 +128,101 @@ function EbaySection() {
   );
 }
 
+function AutoRepriceSection() {
+  const [s, setS] = useState<AppSettings | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    api<AppSettings>("/api/settings").then(setS).catch(() => {});
+  }, []);
+
+  async function patch(update: Partial<AppSettings>) {
+    if (!s) return;
+    const next = { ...s, ...update };
+    setS(next);
+    setSaving(true);
+    try {
+      const fresh = await api<AppSettings>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify(update),
+      });
+      setS(fresh);
+      setSavedAt(Date.now());
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-3">
+        <RefreshCw size={20} className="text-muted" />
+        <h2 className="text-lg font-semibold">Auto-reprice eBay listings</h2>
+        {saving && <Loader2 size={14} className="animate-spin text-muted" />}
+        {!saving && savedAt && Date.now() - savedAt < 3000 && (
+          <span className="text-xs text-accent">Saved</span>
+        )}
+      </div>
+
+      {!s ? (
+        <div className="mt-3 text-sm text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 space-y-4">
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={s.auto_reprice_enabled}
+              onChange={(e) => patch({ auto_reprice_enabled: e.target.checked })}
+              className="mt-1 h-4 w-4 accent-accent"
+            />
+            <div>
+              <div className="font-medium">Enable auto-reprice</div>
+              <p className="text-xs text-muted">
+                When the extension reports a new Amazon price, Droply pushes a new
+                price (Amazon × markup) to the matching eBay listing automatically.
+              </p>
+            </div>
+          </label>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="text-xs uppercase text-muted">Markup %</label>
+              <input
+                type="number"
+                step="0.5"
+                value={s.markup_percent}
+                onChange={(e) => patch({ markup_percent: Number(e.target.value) })}
+                className="input mt-1 w-full"
+                disabled={!s.auto_reprice_enabled}
+              />
+              <p className="mt-1 text-xs text-muted">
+                eBay price = Amazon price × (1 + markup/100)
+              </p>
+            </div>
+            <div>
+              <label className="text-xs uppercase text-muted">Min change to trigger %</label>
+              <input
+                type="number"
+                step="0.1"
+                value={s.min_reprice_change_percent}
+                onChange={(e) =>
+                  patch({ min_reprice_change_percent: Number(e.target.value) })
+                }
+                className="input mt-1 w-full"
+                disabled={!s.auto_reprice_enabled}
+              />
+              <p className="mt-1 text-xs text-muted">
+                Skip tiny changes (e.g. rounding noise) below this threshold.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const [apiOk, setApiOk] = useState<boolean | null>(null);
   const [stats, setStats] = useState<{ total: number; saved_today: number } | null>(null);
@@ -187,6 +282,8 @@ export default function SettingsPage() {
       <Suspense fallback={<div className="card text-muted">Loading eBay status…</div>}>
         <EbaySection />
       </Suspense>
+
+      <AutoRepriceSection />
 
       {/* Chrome extension */}
       <div className="card">

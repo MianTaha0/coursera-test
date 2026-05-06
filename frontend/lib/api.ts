@@ -85,6 +85,26 @@ export type Alert = {
   stock_delta: string | null;
 };
 
+export type AppSettings = {
+  auto_reprice_enabled: boolean;
+  markup_percent: number;
+  min_reprice_change_percent: number;
+};
+
+export type EbayListing = {
+  asin: string;
+  marketplace_id: string;
+  sku: string;
+  offer_id: string | null;
+  listing_id: string | null;
+  listing_url: string | null;
+  last_price: number | null;
+  currency: string | null;
+  markup_percent: number | null;
+  listed_at: string | null;
+  updated_at: string | null;
+};
+
 export type EbayStatus = {
   connected: boolean;
   token_valid?: boolean;
