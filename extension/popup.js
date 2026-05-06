@@ -111,10 +111,75 @@ function copyJson() {
   });
 }
 
+function fmtRelative(iso) {
+  if (!iso) return "Never run";
+  const diff = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "Just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+function refreshRecheckStatus() {
+  chrome.runtime.sendMessage({ type: "DROPLY_RECHECK_STATUS" }, (res) => {
+    const el = $("recheck-status");
+    if (!el) return;
+    if (chrome.runtime.lastError || !res) {
+      el.textContent = "Background worker not ready";
+      return;
+    }
+    if (res.running) {
+      el.textContent = "Recheck in progress…";
+      el.style.color = "#22c55e";
+    } else {
+      el.textContent = `Last run: ${fmtRelative(res.last_at)}`;
+      el.style.color = "";
+    }
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   load();
   $("clear-btn").addEventListener("click", clearAll);
   $("export-btn").addEventListener("click", copyJson);
+
+  // Recheck-all button
+  $("recheck-now-btn").addEventListener("click", () => {
+    const btn = $("recheck-now-btn");
+    btn.disabled = true;
+    btn.textContent = "Running…";
+    chrome.runtime.sendMessage({ type: "DROPLY_RECHECK_NOW" }, (res) => {
+      btn.disabled = false;
+      btn.textContent = "Recheck all";
+      if (chrome.runtime.lastError || !res?.ok) {
+        $("recheck-status").textContent = "Failed — see console";
+      } else {
+        $("recheck-status").textContent = `Re-checked ${res.count} product${res.count === 1 ? "" : "s"}`;
+      }
+      refreshRecheckStatus();
+    });
+  });
+
+  // Interval selector
+  chrome.storage.local.get(["droply_recheck_interval_min"], (res) => {
+    const sel = $("recheck-interval");
+    if (res.droply_recheck_interval_min) sel.value = String(res.droply_recheck_interval_min);
+  });
+  $("recheck-interval").addEventListener("change", (e) => {
+    const minutes = Number(e.target.value);
+    chrome.storage.local.set({ droply_recheck_interval_min: minutes }, () => {
+      // Re-arm the alarm with the new interval
+      chrome.alarms.create("droply-recheck-all", {
+        delayInMinutes: minutes,
+        periodInMinutes: minutes,
+      });
+    });
+  });
+
+  refreshRecheckStatus();
+  setInterval(refreshRecheckStatus, 3000);
   $("amazon-btn").addEventListener("click", () => {
     chrome.tabs.create({ url: "https://www.amazon.com/" });
   });

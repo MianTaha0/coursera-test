@@ -63,3 +63,32 @@ export type Order = {
   tracking_number: string | null;
   created_at: string;
 };
+
+export type PriceSnapshot = {
+  price: number | null;
+  currency: string;
+  stock_status: string;
+  checked_at: string;
+};
+
+export type Alert = {
+  asin: string;
+  title: string;
+  brand: string;
+  image: string | null;
+  amazon_url: string;
+  price: number | null;
+  currency: string;
+  stock_status: string;
+  checked_at: string;
+  price_delta: number | null;
+  stock_delta: string | null;
+};
+
+export type EbayStatus = {
+  connected: boolean;
+  token_valid?: boolean;
+  token_expires_at?: number;
+  connected_at?: string;
+  sandbox?: boolean;
+};

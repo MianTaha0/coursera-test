@@ -1,8 +1,132 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Chrome, Server, CheckCircle2, XCircle, Download } from "lucide-react";
+import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle } from "lucide-react";
 import { api, API_URL } from "@/lib/api";
+import { useSearchParams } from "next/navigation";
+import { Suspense } from "react";
+
+type EbayStatus = {
+  connected: boolean;
+  token_valid?: boolean;
+  token_expires_at?: number;
+  connected_at?: string;
+  sandbox?: boolean;
+};
+
+function EbaySection() {
+  const params = useSearchParams();
+  const [status, setStatus] = useState<EbayStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [flashMsg, setFlashMsg] = useState<string | null>(null);
+
+  async function load() {
+    try {
+      const s = await api<EbayStatus>("/auth/ebay/status");
+      setStatus(s);
+    } catch {
+      setStatus({ connected: false });
+    }
+  }
+
+  useEffect(() => {
+    load();
+    if (params.get("ebay") === "connected") {
+      setFlashMsg("eBay connected successfully!");
+      window.history.replaceState({}, "", "/settings");
+    }
+  }, [params]);
+
+  async function disconnect() {
+    if (!confirm("Disconnect your eBay account?")) return;
+    setBusy(true);
+    try {
+      await api("/auth/ebay", { method: "DELETE" });
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const connectUrl = `${API_URL}/auth/ebay`;
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-3">
+        <Store size={20} className="text-muted" />
+        <h2 className="text-lg font-semibold">eBay Account</h2>
+        {status?.sandbox && (
+          <span className="badge bg-yellow-500/15 text-yellow-400">Sandbox</span>
+        )}
+      </div>
+
+      {flashMsg && (
+        <div className="mt-3 flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-sm text-accent">
+          <CheckCircle2 size={16} /> {flashMsg}
+        </div>
+      )}
+
+      <div className="mt-4">
+        {status === null ? (
+          <div className="flex items-center gap-2 text-sm text-muted">
+            <Loader2 size={16} className="animate-spin" /> Checking connection…
+          </div>
+        ) : status.connected ? (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-accent">
+              <CheckCircle2 size={18} />
+              <span className="font-medium">Connected</span>
+              {status.token_valid === false && (
+                <span className="flex items-center gap-1 text-yellow-400">
+                  <AlertTriangle size={14} /> Token expired — reconnect below
+                </span>
+              )}
+            </div>
+            {status.connected_at && (
+              <p className="text-xs text-muted">
+                Connected {new Date(status.connected_at).toLocaleString()}
+              </p>
+            )}
+            <div className="flex gap-2">
+              <a href={connectUrl} className="btn-secondary text-sm">
+                Reconnect
+              </a>
+              <button
+                onClick={disconnect}
+                disabled={busy}
+                className="btn-danger text-sm"
+              >
+                {busy ? <Loader2 size={14} className="animate-spin" /> : <LogOut size={14} />}
+                Disconnect
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-muted">
+              <XCircle size={18} className="text-red-400" />
+              <span>Not connected</span>
+            </div>
+            <p className="text-sm text-muted">
+              Connect your eBay seller account to publish products directly from the Products page.
+            </p>
+            <a href={connectUrl} className="btn-primary inline-flex">
+              <Store size={16} /> Connect eBay
+            </a>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 rounded-lg border border-border bg-panel2 p-3 text-xs text-muted space-y-1">
+        <p className="font-medium text-white/60">Setup required</p>
+        <p>1. In the <a href="https://developer.ebay.com/my/keys" target="_blank" rel="noopener" className="text-accent hover:underline">eBay Developer Portal</a>, copy your <b>App ID</b> and <b>Cert ID</b>.</p>
+        <p>2. Set <code>EBAY_CLIENT_ID</code>, <code>EBAY_CLIENT_SECRET</code>, and <code>EBAY_RU_NAME</code> in your backend environment.</p>
+        <p>3. Update the <b>Auth accepted URL</b> in your eBay app to <code>{API_URL}/auth/ebay/callback</code>.</p>
+        <p>4. Click <b>Connect eBay</b> above.</p>
+      </div>
+    </div>
+  );
+}
 
 export default function SettingsPage() {
   const [apiOk, setApiOk] = useState<boolean | null>(null);
@@ -21,9 +145,10 @@ export default function SettingsPage() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold">Settings</h1>
-        <p className="text-sm text-muted">Configure how your dashboard talks to the Chrome extension.</p>
+        <p className="text-sm text-muted">Configure backend, Chrome extension, and eBay connection.</p>
       </div>
 
+      {/* Backend status */}
       <div className="card">
         <div className="flex items-center gap-3">
           <Server size={20} className="text-muted" />
@@ -58,6 +183,12 @@ export default function SettingsPage() {
         </p>
       </div>
 
+      {/* eBay */}
+      <Suspense fallback={<div className="card text-muted">Loading eBay status…</div>}>
+        <EbaySection />
+      </Suspense>
+
+      {/* Chrome extension */}
       <div className="card">
         <div className="flex items-center gap-3">
           <Chrome size={20} className="text-muted" />

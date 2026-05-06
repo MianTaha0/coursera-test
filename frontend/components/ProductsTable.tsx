@@ -1,9 +1,10 @@
 "use client";
 
-import { ExternalLink, Tag, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon } from "lucide-react";
+import { useEffect, useState } from "react";
 import { api, Product } from "@/lib/api";
 import { money, date } from "@/lib/format";
+import PriceHistoryModal from "./PriceHistoryModal";
 
 const DEFAULT_MARKUP_PERCENT = 30;
 
@@ -36,12 +37,22 @@ export default function ProductsTable({
   compact?: boolean;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
+  const [ebayConnected, setEbayConnected] = useState(false);
+  const [historyProduct, setHistoryProduct] = useState<Product | null>(null);
+  // track which ASINs have been listed this session
+  const [listed, setListed] = useState<Record<string, string>>({});
 
-  function flash(msg: string) {
-    setToast(msg);
+  useEffect(() => {
+    api<{ connected: boolean }>("/auth/ebay/status")
+      .then((s) => setEbayConnected(s.connected))
+      .catch(() => {});
+  }, []);
+
+  function flash(msg: string, type: "ok" | "err" = "ok") {
+    setToast({ msg, type });
     window.clearTimeout((flash as any)._t);
-    (flash as any)._t = window.setTimeout(() => setToast(null), 2200);
+    (flash as any)._t = window.setTimeout(() => setToast(null), 3500);
   }
 
   async function remove(p: Product) {
@@ -55,20 +66,34 @@ export default function ProductsTable({
     }
   }
 
-  async function listOnEbay(p: Product) {
+  async function listOnEbayApi(p: Product) {
+    setBusy(p.asin);
+    try {
+      const result = await api<{ ok: boolean; listing_url: string; listing_price: number }>(
+        `/api/products/${encodeURIComponent(p.asin)}/list-ebay`,
+        { method: "POST", body: JSON.stringify({}) }
+      );
+      setListed((prev) => ({ ...prev, [p.asin]: result.listing_url }));
+      flash(`Listed on eBay at $${result.listing_price} — opening listing…`, "ok");
+      window.open(result.listing_url, "_blank", "noopener");
+    } catch (e: any) {
+      flash(e.message || "eBay listing failed.", "err");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function listOnEbayManual(p: Product) {
     const lp = ebayPrice(p.price);
     const block = buildClipboardBlock(p, lp);
     try {
       await navigator.clipboard.writeText(block);
-      flash("Details copied. Find a similar item → 'Sell one like this'.");
+      flash("Details copied. Find a similar item → 'Sell one like this'.", "ok");
     } catch {
-      flash("Could not copy automatically — open the product page to copy.");
+      flash("Could not copy automatically — open the product page to copy.", "err");
     }
-    // eBay's catalog search. Pick any matching listing and click 'Sell one
-    // like this' on the right rail — eBay prefills 90% of the listing form.
     const q = encodeURIComponent((p.title || p.asin || "").slice(0, 80));
-    const url = `https://www.ebay.com/sch/i.html?_nkw=${q}&_sacat=0`;
-    window.open(url, "_blank", "noopener");
+    window.open(`https://www.ebay.com/sch/i.html?_nkw=${q}&_sacat=0`, "_blank", "noopener");
   }
 
   if (!products.length) {
@@ -97,6 +122,8 @@ export default function ProductsTable({
           <tbody>
             {products.map((p) => {
               const lp = ebayPrice(p.price);
+              const listingUrl = listed[p.asin];
+              const isBusy = busy === p.asin;
               return (
                 <tr key={p.asin} className="border-t border-border">
                   <td className="td">
@@ -135,12 +162,43 @@ export default function ProductsTable({
                   {!compact && <td className="td text-muted">{date(p.saved_at)}</td>}
                   <td className="td text-right">
                     <div className="flex justify-end gap-2">
+                      {listingUrl ? (
+                        <a
+                          href={listingUrl}
+                          target="_blank"
+                          rel="noopener"
+                          className="btn-primary text-xs"
+                          title="View eBay listing"
+                        >
+                          <CheckCircle2 size={14} /> Listed
+                        </a>
+                      ) : (
+                        <button
+                          onClick={() =>
+                            ebayConnected ? listOnEbayApi(p) : listOnEbayManual(p)
+                          }
+                          disabled={isBusy}
+                          className="btn-primary text-xs"
+                          title={
+                            ebayConnected
+                              ? "Publish to eBay via API"
+                              : "Copy details and open eBay listing flow"
+                          }
+                        >
+                          {isBusy ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <Tag size={14} />
+                          )}
+                          {ebayConnected ? "Publish to eBay" : "List on eBay"}
+                        </button>
+                      )}
                       <button
-                        onClick={() => listOnEbay(p)}
-                        className="btn-primary text-xs"
-                        title="Copy details and open eBay listing flow"
+                        onClick={() => setHistoryProduct(p)}
+                        className="btn-secondary text-xs"
+                        title="Price history"
                       >
-                        <Tag size={14} /> List on eBay
+                        <LineChartIcon size={14} />
                       </button>
                       {p.amazon_url && (
                         <a
@@ -154,7 +212,7 @@ export default function ProductsTable({
                         </a>
                       )}
                       <button
-                        disabled={busy === p.asin}
+                        disabled={isBusy}
                         onClick={() => remove(p)}
                         className="btn-danger text-xs"
                         title="Remove"
@@ -171,9 +229,22 @@ export default function ProductsTable({
       </div>
 
       {toast && (
-        <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-accent/30 bg-panel px-4 py-2 text-sm text-accent shadow-lg">
-          {toast}
+        <div
+          className={`fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg border px-4 py-2 text-sm shadow-lg ${
+            toast.type === "ok"
+              ? "border-accent/30 bg-panel text-accent"
+              : "border-red-500/30 bg-panel text-red-400"
+          }`}
+        >
+          {toast.msg}
         </div>
+      )}
+
+      {historyProduct && (
+        <PriceHistoryModal
+          product={historyProduct}
+          onClose={() => setHistoryProduct(null)}
+        />
       )}
     </>
   );

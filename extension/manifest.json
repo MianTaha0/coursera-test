@@ -3,7 +3,10 @@
   "name": "Droply — Save Amazon products",
   "version": "1.0.0",
   "description": "One-click capture of Amazon product data. Self-contained — saves to your browser, no account needed.",
-  "permissions": ["activeTab", "storage", "scripting", "tabs"],
+  "permissions": ["activeTab", "storage", "scripting", "tabs", "alarms"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "host_permissions": [
     "https://www.amazon.com/*",
     "https://www.amazon.co.uk/*",

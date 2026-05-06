@@ -103,6 +103,27 @@
         <button id="clear-btn" class="btn btn-secondary" style="flex: 1;">Clear all</button>
       </div>
 
+      <div style="margin-top: 10px; background: #12151c; border: 1px solid #222632; border-radius: 8px; padding: 10px;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 6px;">
+          <div>
+            <div style="font-size: 12px; font-weight: 600;">Auto-recheck</div>
+            <div id="recheck-status" class="muted" style="font-size: 11px; margin-top: 2px;">Idle</div>
+          </div>
+          <button id="recheck-now-btn" class="btn" style="flex: 0 0 auto; padding: 7px 12px; font-size: 12px;">Recheck all</button>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; margin-top: 8px;">
+          <label class="muted" style="font-size: 11px;" for="recheck-interval">Every</label>
+          <select id="recheck-interval" style="background: #171b24; color: #e6e8ee; border: 1px solid #222632; border-radius: 6px; padding: 4px 6px; font-size: 12px;">
+            <option value="60">1 hour</option>
+            <option value="180">3 hours</option>
+            <option value="360" selected>6 hours</option>
+            <option value="720">12 hours</option>
+            <option value="1440">24 hours</option>
+          </select>
+          <span class="muted" style="font-size: 11px;">in the background</span>
+        </div>
+      </div>
+
       <details style="margin-top: 10px; background: #12151c; border: 1px solid #222632; border-radius: 8px; padding: 8px 10px;">
         <summary style="color: #8b93a7; cursor: pointer; font-size: 12px;">Backend URL</summary>
         <input

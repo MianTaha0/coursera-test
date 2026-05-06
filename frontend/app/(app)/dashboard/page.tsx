@@ -10,27 +10,30 @@ import {
   ResponsiveContainer,
   CartesianGrid,
 } from "recharts";
-import { DollarSign, Package, ShoppingCart, Activity, AlertCircle } from "lucide-react";
+import { DollarSign, Package, ShoppingCart, Activity, AlertCircle, Bell, TrendingUp, TrendingDown } from "lucide-react";
 import StatsCard from "@/components/StatsCard";
 import ProductsTable from "@/components/ProductsTable";
-import { api, Product, Stats } from "@/lib/api";
+import { api, Alert, Product, Stats } from "@/lib/api";
 import { money } from "@/lib/format";
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [recent, setRecent] = useState<Product[]>([]);
+  const [alerts, setAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
   async function load() {
     try {
       setErr(null);
-      const [s, p] = await Promise.all([
+      const [s, p, a] = await Promise.all([
         api<Stats>("/api/stats"),
         api<Product[]>("/api/products?limit=8"),
+        api<Alert[]>("/api/alerts?days=30&limit=8"),
       ]);
       setStats(s);
       setRecent(p);
+      setAlerts(a);
     } catch (e: any) {
       setErr(e.message || String(e));
     } finally {
@@ -119,6 +122,61 @@ export default function DashboardPage() {
             </ul>
           )}
         </div>
+      </div>
+
+      <div className="card">
+        <div className="mb-3 flex items-center gap-2">
+          <Bell size={18} className="text-muted" />
+          <h2 className="text-lg font-semibold">Recent alerts</h2>
+          <span className="text-xs text-muted">last 30 days</span>
+        </div>
+        {alerts.length === 0 ? (
+          <div className="text-sm text-muted">
+            No price or stock changes detected yet. Re-save a product on Amazon to record a new snapshot.
+          </div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {alerts.map((a, i) => (
+              <li key={`${a.asin}-${i}`} className="flex items-center gap-3 py-2 text-sm">
+                {a.image && (
+                  /* eslint-disable-next-line @next/next/no-img-element */
+                  <img
+                    src={a.image}
+                    alt=""
+                    referrerPolicy="no-referrer"
+                    className="h-9 w-9 rounded border border-border bg-white object-contain"
+                  />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="line-clamp-1 font-medium">{a.title || a.asin}</div>
+                  <div className="text-xs text-muted">{new Date(a.checked_at).toLocaleString()}</div>
+                </div>
+                {a.price_delta !== null && a.price_delta !== 0 && (
+                  <span
+                    className={`flex items-center gap-1 text-xs font-medium ${
+                      a.price_delta < 0 ? "text-accent" : "text-red-400"
+                    }`}
+                  >
+                    {a.price_delta < 0 ? <TrendingDown size={12} /> : <TrendingUp size={12} />}
+                    {a.price_delta > 0 ? "+" : ""}
+                    {money(a.price_delta, a.currency)} → {money(a.price, a.currency)}
+                  </span>
+                )}
+                {a.stock_delta && (
+                  <span
+                    className={`badge ${
+                      a.stock_status === "in_stock"
+                        ? "bg-accent/15 text-accent"
+                        : "bg-red-500/15 text-red-400"
+                    }`}
+                  >
+                    {a.stock_delta}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       <div>
