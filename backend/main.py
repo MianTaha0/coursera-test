@@ -246,6 +246,23 @@ def init_db() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_order ON fulfillment_attempts(ebay_order_id, started_at DESC)")
 
+        # Outbound buyer messages (queued by event triggers, sent manually for now)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS outbound_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ebay_order_id TEXT NOT NULL,
+                template_slug TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                trigger_event TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbound_order ON outbound_messages(ebay_order_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_messages(status, created_at DESC)")
+
         # Buyer-message templates
         conn.execute("""
             CREATE TABLE IF NOT EXISTS message_templates (
@@ -1274,6 +1291,73 @@ def _row_to_template(r: sqlite3.Row) -> dict[str, Any]:
     return dict(r)
 
 
+def _render_template_text(text: str, vars: dict[str, str]) -> str:
+    for k, v in vars.items():
+        text = text.replace("{" + k + "}", str(v or ""))
+    return text
+
+
+def _order_to_template_vars(order: sqlite3.Row) -> dict[str, str]:
+    """Map an `orders` row to the variables our default templates expect."""
+    item_title = order["sku"] or order["product_asin"] or "your order"
+    if order["product_asin"]:
+        with db() as conn:
+            p = conn.execute(
+                "SELECT title FROM products WHERE asin = ?", (order["product_asin"],)
+            ).fetchone()
+        if p and p["title"]:
+            item_title = p["title"]
+    return {
+        "buyer_name": (order["ship_to_name"] or order["buyer_username"] or "there"),
+        "item_title": item_title,
+        "order_id": order["ebay_order_id"] or "",
+        "tracking_number": order["tracking_number"] or "",
+        "carrier": order["tracking_carrier"] or "",
+        "est_delivery_date": "",   # not yet captured from eBay
+        "seller_name": "Droply",
+    }
+
+
+def queue_buyer_message(
+    *, ebay_order_id: str, trigger_event: str, template_slug: str
+) -> Optional[int]:
+    """Render the named template using the order's data and append to outbound queue.
+
+    Skips silently if the template/order doesn't exist or the event has already
+    been queued for this order (idempotent on (order, event)).
+    """
+    with db() as conn:
+        order = conn.execute(
+            "SELECT * FROM orders WHERE ebay_order_id = ?", (ebay_order_id,)
+        ).fetchone()
+        if not order:
+            return None
+        tpl = conn.execute(
+            "SELECT * FROM message_templates WHERE slug = ?", (template_slug,)
+        ).fetchone()
+        if not tpl:
+            return None
+        # Idempotency: don't queue the same event twice for an order
+        existing = conn.execute(
+            "SELECT id FROM outbound_messages WHERE ebay_order_id = ? AND trigger_event = ?",
+            (ebay_order_id, trigger_event),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+
+        vars = _order_to_template_vars(order)
+        subject = _render_template_text(tpl["subject"], vars)
+        body = _render_template_text(tpl["body"], vars)
+        cur = conn.execute(
+            """INSERT INTO outbound_messages
+               (ebay_order_id, template_slug, subject, body, trigger_event, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (ebay_order_id, template_slug, subject, body, trigger_event,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        return cur.lastrowid
+
+
 def _slugify(s: str) -> str:
     out = "".join(c if c.isalnum() else "_" for c in s.strip().lower())
     return "_".join(filter(None, out.split("_")))[:60] or "template"
@@ -1357,6 +1441,73 @@ def render_template(template_id: int, payload: RenderIn):
     }
 
 
+# ---------------------------------------------------------------------------
+# Routes — outbound buyer messages
+# ---------------------------------------------------------------------------
+@app.get("/api/messages/outbound")
+def list_outbound_messages(
+    order_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+):
+    sql = "SELECT * FROM outbound_messages WHERE 1=1"
+    params: list[Any] = []
+    if order_id:
+        sql += " AND ebay_order_id = ?"
+        params.append(order_id)
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(int(limit))
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/messages/outbound/{message_id}/mark-sent")
+def mark_message_sent(message_id: int):
+    with db() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM outbound_messages WHERE id = ?", (message_id,)
+        ).fetchone():
+            raise HTTPException(404, "message not found")
+        conn.execute(
+            "UPDATE outbound_messages SET status = 'sent', sent_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), message_id),
+        )
+    return {"ok": True}
+
+
+@app.delete("/api/messages/outbound/{message_id}")
+def discard_message(message_id: int):
+    with db() as conn:
+        cur = conn.execute("DELETE FROM outbound_messages WHERE id = ?", (message_id,))
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+class QueueIn(BaseModel):
+    template_slug: str
+    trigger_event: str = "manual"
+
+
+@app.post("/api/orders/{order_id}/messages")
+def queue_message_for_order(order_id: str, payload: QueueIn):
+    """Manually queue any template for an order (e.g. delivered, feedback_request)."""
+    msg_id = queue_buyer_message(
+        ebay_order_id=order_id,
+        trigger_event=payload.trigger_event,
+        template_slug=payload.template_slug,
+    )
+    if msg_id is None:
+        raise HTTPException(400, "could not queue — order or template missing")
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM outbound_messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+    return dict(row) if row else {"id": msg_id}
+
+
 @app.get("/api/listings")
 def api_listings():
     with db() as conn:
@@ -1386,10 +1537,14 @@ def _addr_field(addr: dict, *keys, default="") -> str:
 
 
 def _persist_order(order: dict[str, Any]) -> None:
-    """Map an eBay Fulfillment API order JSON into our orders table."""
+    """Map an eBay Fulfillment API order JSON into our orders table.
+
+    Returns True if the order was newly inserted (so callers can fire one-time
+    side effects like queueing the order_confirmed buyer message).
+    """
     line_items = order.get("lineItems", []) or []
     if not line_items:
-        return
+        return False
     li = line_items[0]
     sku = li.get("sku") or ""
     asin = sku[len("DROPLY-"):] if sku.startswith("DROPLY-") else None
@@ -1409,7 +1564,12 @@ def _persist_order(order: dict[str, Any]) -> None:
     profit = round(sale_price - amazon_cost, 2)
 
     now = datetime.now(timezone.utc).isoformat()
+    is_new = False
     with db() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM orders WHERE ebay_order_id = ?", (order.get("orderId"),)
+        ).fetchone()
+        is_new = existing is None
         conn.execute(
             """
             INSERT INTO orders (
@@ -1467,6 +1627,7 @@ def _persist_order(order: dict[str, Any]) -> None:
                 now,
             ),
         )
+    return is_new
 
 
 @app.post("/api/orders/sync")
@@ -1487,9 +1648,17 @@ async def sync_orders(limit: int = 50):
         raise HTTPException(502, f"eBay order fetch failed: {r.text}")
     data = r.json()
     orders = data.get("orders", []) or []
+    new_count = 0
     for o in orders:
-        _persist_order(o)
-    return {"ok": True, "synced": len(orders)}
+        if _persist_order(o):
+            new_count += 1
+            # Auto-queue the order_confirmed buyer message for new orders
+            queue_buyer_message(
+                ebay_order_id=o.get("orderId"),
+                trigger_event="order_synced",
+                template_slug="order_confirmed",
+            )
+    return {"ok": True, "synced": len(orders), "new": new_count}
 
 
 class TrackingIn(BaseModel):
@@ -1541,6 +1710,12 @@ async def submit_tracking(order_id: str, payload: TrackingIn):
                WHERE ebay_order_id = ?""",
             (payload.tracking_number, payload.carrier.upper(), now, order_id),
         )
+    # Auto-queue the "shipped" buyer message with tracking variables filled in
+    queue_buyer_message(
+        ebay_order_id=order_id,
+        trigger_event="tracking_submitted",
+        template_slug="shipped",
+    )
     return {"ok": True}
 
 

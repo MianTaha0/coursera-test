@@ -166,6 +166,18 @@ export function computeNet(
   };
 }
 
+export type OutboundMessage = {
+  id: number;
+  ebay_order_id: string;
+  template_slug: string;
+  subject: string;
+  body: string;
+  status: "queued" | "sent";
+  trigger_event: string;
+  created_at: string;
+  sent_at: string | null;
+};
+
 export type FulfillmentAttempt = {
   id: number;
   ebay_order_id: string;

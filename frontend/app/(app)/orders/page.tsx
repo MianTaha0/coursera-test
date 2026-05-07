@@ -11,8 +11,10 @@ import {
   CheckCircle2,
   AlertCircle,
   Bot,
+  Mail,
+  Trash2,
 } from "lucide-react";
-import { api, Order } from "@/lib/api";
+import { api, Order, OutboundMessage } from "@/lib/api";
 import { money, date } from "@/lib/format";
 
 const CARRIERS = ["USPS", "FEDEX", "UPS", "DHL"];
@@ -337,12 +339,182 @@ export default function OrdersPage() {
                         )}
                       </div>
                     </div>
+
+                    <OrderMessages
+                      orderId={o.ebay_order_id}
+                      onFlash={flash}
+                    />
                   </div>
                 )}
               </div>
             );
           })}
         </div>
+      )}
+    </div>
+  );
+}
+
+const ADDITIONAL_TEMPLATES = [
+  { slug: "delivered", label: "Delivered check-in" },
+  { slug: "feedback_request", label: "Feedback request" },
+];
+
+function OrderMessages({
+  orderId,
+  onFlash,
+}: {
+  orderId: string;
+  onFlash: (msg: string) => void;
+}) {
+  const [messages, setMessages] = useState<OutboundMessage[]>([]);
+  const [busy, setBusy] = useState<number | null>(null);
+  const [queueing, setQueueing] = useState(false);
+
+  async function load() {
+    try {
+      const res = await api<OutboundMessage[]>(
+        `/api/messages/outbound?order_id=${encodeURIComponent(orderId)}`,
+      );
+      setMessages(res);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, [orderId]);
+
+  async function copyAndMarkSent(m: OutboundMessage) {
+    setBusy(m.id);
+    try {
+      await navigator.clipboard.writeText(`Subject: ${m.subject}\n\n${m.body}`);
+      onFlash("Copied — pasting into eBay messages…");
+      window.open("https://www.ebay.com/mesg/", "_blank", "noopener");
+      await api(`/api/messages/outbound/${m.id}/mark-sent`, { method: "POST" });
+      await load();
+    } catch (e: any) {
+      onFlash(`Failed: ${e.message}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function discard(m: OutboundMessage) {
+    if (!confirm("Discard this queued message?")) return;
+    setBusy(m.id);
+    try {
+      await api(`/api/messages/outbound/${m.id}`, { method: "DELETE" });
+      await load();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function queueAdditional(slug: string) {
+    setQueueing(true);
+    try {
+      await api(`/api/orders/${encodeURIComponent(orderId)}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ template_slug: slug, trigger_event: "manual" }),
+      });
+      onFlash(`Queued ${slug.replace("_", " ")} message`);
+      await load();
+    } catch (e: any) {
+      onFlash(`Failed: ${e.message}`);
+    } finally {
+      setQueueing(false);
+    }
+  }
+
+  // Hide templates already queued for this order so we don't double-queue
+  const queuedSlugs = new Set(messages.map((m) => m.template_slug));
+  const remaining = ADDITIONAL_TEMPLATES.filter((t) => !queuedSlugs.has(t.slug));
+
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <div className="flex items-center justify-between gap-2">
+        <h4 className="flex items-center gap-2 text-xs uppercase text-muted">
+          <Mail size={14} /> Buyer messages
+        </h4>
+        {remaining.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {remaining.map((t) => (
+              <button
+                key={t.slug}
+                onClick={() => queueAdditional(t.slug)}
+                disabled={queueing}
+                className="btn-secondary text-xs"
+              >
+                + {t.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {messages.length === 0 ? (
+        <div className="mt-2 text-xs text-muted">
+          No queued messages. <code>order_confirmed</code> is auto-queued on order sync; <code>shipped</code> is auto-queued when tracking is submitted.
+        </div>
+      ) : (
+        <ul className="mt-2 space-y-2">
+          {messages.map((m) => (
+            <li key={m.id} className="rounded-lg border border-border bg-panel p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-sm">{m.subject}</span>
+                    <span
+                      className={`badge text-[10px] ${
+                        m.status === "sent"
+                          ? "bg-accent/15 text-accent"
+                          : "bg-blue-500/15 text-blue-300"
+                      }`}
+                    >
+                      {m.status}
+                    </span>
+                    <span className="text-[10px] text-muted">
+                      {m.template_slug} · {m.trigger_event}
+                    </span>
+                  </div>
+                  <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-words font-sans text-xs text-white/70">
+                    {m.body}
+                  </pre>
+                </div>
+                <div className="flex shrink-0 flex-col gap-1">
+                  {m.status === "queued" ? (
+                    <button
+                      onClick={() => copyAndMarkSent(m)}
+                      disabled={busy === m.id}
+                      className="btn-primary text-xs"
+                      title="Copy to clipboard, open eBay messages, mark as sent"
+                    >
+                      {busy === m.id ? (
+                        <Loader2 size={12} className="animate-spin" />
+                      ) : (
+                        <Copy size={12} />
+                      )}
+                      Copy &amp; send
+                    </button>
+                  ) : (
+                    <span className="text-[10px] text-muted">
+                      Sent {m.sent_at ? new Date(m.sent_at).toLocaleString() : ""}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => discard(m)}
+                    disabled={busy === m.id}
+                    className="btn-danger text-xs"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
