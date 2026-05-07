@@ -67,6 +67,7 @@ class FulfillResult:
     carrier: Optional[str] = None
     error: Optional[str] = None
     screenshot_path: Optional[str] = None
+    notes: Optional[str] = None  # informational (e.g. "address: matched")
 
 
 def _now() -> str:
@@ -96,6 +97,136 @@ def record_attempt_finish(
             attempt_id,
         ),
     )
+
+
+async def _maybe_click(page, selectors: list[str], timeout_ms: int = 4000) -> bool:
+    """Try a list of selectors and click the first one that's visible. Returns True on success."""
+    for sel in selectors:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=timeout_ms)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _maybe_fill(page, selectors: list[str], value: str, timeout_ms: int = 4000) -> bool:
+    """Fill the first matching visible input."""
+    if not value:
+        return False
+    for sel in selectors:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count() and await loc.is_visible():
+                await loc.fill(value, timeout=timeout_ms)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def set_shipping_address(page, buyer: BuyerAddress) -> str:
+    """Best-effort: replace the default Amazon shipping address with the eBay
+    buyer's address. Returns one of:
+        "set"       — new address entered + selected
+        "matched"   — found an existing saved address whose name matches
+        "skipped"   — the address picker wasn't found (already on a flow that
+                      doesn't expose it; caller should fall through)
+        "failed"    — picker opened but the flow broke down
+
+    The Amazon DOM for this varies wildly by account / region / A-B test, so
+    we try multiple selector strategies and stop fast if none match.
+    """
+    # Step 1 — open the address picker
+    opened = await _maybe_click(page, [
+        "a:has-text('Change')",
+        "a:has-text('Ship to a different address')",
+        "input[name='shipToThisAddress']",
+        "a#shipaddrLink",
+        "a[data-action='a-modal']:has-text('address')",
+        "input[aria-labelledby*='changeAddress']",
+    ])
+    if not opened:
+        return "skipped"
+    await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+
+    # Step 2 — if a saved address matches the buyer's full name, just pick it
+    try:
+        candidates = page.locator(f"li:has-text('{buyer.full_name}')")
+        if await candidates.count():
+            await candidates.first.locator("input[type='radio']").first.click()
+            await _maybe_click(page, [
+                "input[aria-labelledby*='shipToThisAddress']",
+                "input[name='shipToThisAddress']",
+                "span:has-text('Use this address')",
+            ])
+            return "matched"
+    except Exception:
+        pass
+
+    # Step 3 — open the "Add a new address" form
+    opened_form = await _maybe_click(page, [
+        "a:has-text('Add a new delivery address')",
+        "a:has-text('Add a new address')",
+        "div:has-text('Add a new address') a",
+        "input[aria-labelledby*='addAddress']",
+    ])
+    if not opened_form:
+        return "failed"
+
+    # Step 4 — fill the form
+    await _maybe_fill(page, [
+        "#address-ui-widgets-enterAddressFullName",
+        "input[name='enterAddressFullName']",
+        "input[autocomplete='name']",
+    ], buyer.full_name)
+    await _maybe_fill(page, [
+        "#address-ui-widgets-enterAddressPhoneNumber",
+        "input[name='enterAddressPhoneNumber']",
+        "input[autocomplete='tel']",
+    ], buyer.phone or "0000000000")
+    await _maybe_fill(page, [
+        "#address-ui-widgets-enterAddressLine1",
+        "input[name='enterAddressLine1']",
+        "input[autocomplete='address-line1']",
+    ], buyer.street1)
+    if buyer.street2:
+        await _maybe_fill(page, [
+            "#address-ui-widgets-enterAddressLine2",
+            "input[name='enterAddressLine2']",
+        ], buyer.street2)
+    await _maybe_fill(page, [
+        "#address-ui-widgets-enterAddressCity",
+        "input[name='enterAddressCity']",
+        "input[autocomplete='address-level2']",
+    ], buyer.city)
+    await _maybe_fill(page, [
+        "#address-ui-widgets-enterAddressPostalCode",
+        "input[name='enterAddressPostalCode']",
+        "input[autocomplete='postal-code']",
+    ], buyer.postal_code)
+    # State is sometimes a select, sometimes a text field
+    try:
+        await page.locator(
+            "select[name='enterAddressStateOrRegion'], #address-ui-widgets-enterAddressStateOrRegion"
+        ).first.select_option(buyer.state, timeout=3000)
+    except Exception:
+        await _maybe_fill(page, [
+            "#address-ui-widgets-enterAddressStateOrRegion",
+            "input[name='enterAddressStateOrRegion']",
+        ], buyer.state)
+
+    # Step 5 — submit + use this address
+    await _maybe_click(page, [
+        "input[aria-labelledby*='useThisAddress']",
+        "input[name='useThisAddress']",
+        "span:has-text('Use this address')",
+        "input[type='submit'][aria-label*='Use this address']",
+    ])
+    await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+    return "set"
 
 
 @asynccontextmanager
@@ -183,11 +314,14 @@ async def fulfill_on_amazon(
 
             await page.wait_for_load_state("domcontentloaded", timeout=60_000)
 
-            # TODO: change shipping address to req.buyer here.
-            # The address form has many shapes; for the first iteration we
-            # rely on the user having pre-saved the buyer's address as the
-            # default in the Amazon account, OR they intervene during
-            # !headless mode to pick the right address.
+            # Override the shipping address with the eBay buyer's. Best-effort:
+            # if the page layout doesn't expose the picker, we fall through
+            # and rely on the operator (in non-headless mode) to fix it.
+            address_status = "skipped"
+            try:
+                address_status = await set_shipping_address(page, req.buyer)
+            except Exception as e:
+                address_status = f"error: {str(e)[:80]}"
 
             # Capture the review page before placing
             await page.screenshot(path=str(screenshot), full_page=True)
@@ -196,6 +330,7 @@ async def fulfill_on_amazon(
                 return FulfillResult(
                     status="dry_run",
                     screenshot_path=str(screenshot),
+                    notes=f"address: {address_status}",
                 )
 
             # Place order — DANGEROUS, only when dry_run is off
@@ -227,6 +362,7 @@ async def fulfill_on_amazon(
                 status="success",
                 amazon_order_id=amazon_order_id,
                 screenshot_path=str(screenshot),
+                notes=f"address: {address_status}",
             )
     except Exception as e:
         try:

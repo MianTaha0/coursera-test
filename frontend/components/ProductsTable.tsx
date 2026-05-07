@@ -1,8 +1,8 @@
 "use client";
 
-import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon } from "lucide-react";
+import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon, ShieldAlert } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { api, AppSettings, EbayListing, Product, computeNet } from "@/lib/api";
+import { api, AppSettings, EbayListing, Product, VeroMatch, computeNet } from "@/lib/api";
 import { money, date } from "@/lib/format";
 import PriceHistoryModal from "./PriceHistoryModal";
 
@@ -42,6 +42,8 @@ export default function ProductsTable({
   const [historyProduct, setHistoryProduct] = useState<Product | null>(null);
   // ASIN → listing record (persisted server-side)
   const [listings, setListings] = useState<Record<string, EbayListing>>({});
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   async function loadListings() {
     try {
@@ -55,13 +57,24 @@ export default function ProductsTable({
   }
 
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [veroMap, setVeroMap] = useState<Record<string, VeroMatch[]>>({});
   const markupPercent = settings?.markup_percent ?? DEFAULT_MARKUP_PERCENT;
+
+  async function loadVero() {
+    try {
+      const res = await api<Record<string, VeroMatch[]>>("/api/vero/scan");
+      setVeroMap(res || {});
+    } catch {
+      /* ignore */
+    }
+  }
 
   useEffect(() => {
     api<{ connected: boolean }>("/auth/ebay/status")
       .then((s) => setEbayConnected(s.connected))
       .catch(() => {});
     loadListings();
+    loadVero();
     api<AppSettings>("/api/settings").then(setSettings).catch(() => {});
   }, []);
 
@@ -82,12 +95,24 @@ export default function ProductsTable({
     }
   }
 
-  async function listOnEbayApi(p: Product) {
+  async function listOnEbayApi(p: Product, overrideVero = false) {
+    // Pre-flight VeRO check
+    const vero = veroMap[p.asin] || [];
+    const blocking = vero.filter((m) => m.level === "block");
+    if (blocking.length && !overrideVero) {
+      const kws = blocking.map((m) => m.keyword).join(", ");
+      const reasons = blocking.map((m) => `• ${m.keyword}: ${m.reason || ""}`).join("\n");
+      const proceed = confirm(
+        `⚠️ VeRO watchlist match: ${kws}\n\n${reasons}\n\nListing branded items can get your eBay account suspended. Override and publish anyway?`,
+      );
+      if (!proceed) return;
+      overrideVero = true;
+    }
     setBusy(p.asin);
     try {
       const result = await api<{ ok: boolean; listing_url: string; listing_price: number }>(
         `/api/products/${encodeURIComponent(p.asin)}/list-ebay`,
-        { method: "POST", body: JSON.stringify({}) }
+        { method: "POST", body: JSON.stringify({ override_vero: overrideVero }) }
       );
       flash(`Listed on eBay at ${money(result.listing_price, p.currency)} — opening listing…`, "ok");
       await loadListings();
@@ -112,6 +137,62 @@ export default function ProductsTable({
     window.open(`https://www.ebay.com/sch/i.html?_nkw=${q}&_sacat=0`, "_blank", "noopener");
   }
 
+  function toggleSelect(asin: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(asin)) next.delete(asin);
+      else next.add(asin);
+      return next;
+    });
+  }
+
+  function selectAllUnpublished() {
+    const next = new Set<string>();
+    for (const p of products) {
+      if (!listings[p.asin]?.listing_url) next.add(p.asin);
+    }
+    setSelected(next);
+  }
+
+  async function bulkPublish() {
+    if (!selected.size) return;
+    const asins = Array.from(selected);
+    // Warn if any are VeRO-blocked
+    const blocked = asins.filter((a) =>
+      (veroMap[a] || []).some((m) => m.level === "block"),
+    );
+    let overrideVero = false;
+    if (blocked.length) {
+      const proceed = confirm(
+        `${blocked.length} of ${asins.length} selected products match the VeRO watchlist. Override and publish anyway?`,
+      );
+      if (!proceed) return;
+      overrideVero = true;
+    }
+    setBulkBusy(true);
+    try {
+      const result = await api<{ total: number; success: number; failed: number }>(
+        "/api/products/list-ebay-bulk",
+        {
+          method: "POST",
+          body: JSON.stringify({ asins, override_vero: overrideVero }),
+        },
+      );
+      flash(
+        `Bulk publish: ${result.success}/${result.total} succeeded${
+          result.failed ? ` · ${result.failed} failed` : ""
+        }`,
+        result.failed ? "err" : "ok",
+      );
+      setSelected(new Set());
+      await loadListings();
+    } catch (e: any) {
+      flash(e.message || "Bulk publish failed.", "err");
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   if (!products.length) {
     return (
       <div className="card text-center text-muted">
@@ -120,12 +201,61 @@ export default function ProductsTable({
     );
   }
 
+  const allSelectable = products.filter((p) => !listings[p.asin]?.listing_url);
+  const allSelected =
+    allSelectable.length > 0 && allSelectable.every((p) => selected.has(p.asin));
+
   return (
     <>
+      {!compact && selected.size > 0 && (
+        <div className="sticky top-0 z-10 -mt-2 mb-3 flex items-center justify-between gap-3 rounded-lg border border-accent/40 bg-accent/15 px-4 py-2 text-sm">
+          <div>
+            <b>{selected.size}</b> selected
+            <button
+              onClick={() => setSelected(new Set())}
+              className="ml-3 text-xs text-muted hover:text-white"
+            >
+              Clear
+            </button>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={selectAllUnpublished}
+              className="btn-secondary text-xs"
+            >
+              Select all unpublished ({allSelectable.length})
+            </button>
+            <button
+              onClick={bulkPublish}
+              disabled={bulkBusy || !ebayConnected}
+              className="btn-primary text-xs"
+              title={ebayConnected ? "Publish selected products to eBay" : "Connect eBay first"}
+            >
+              {bulkBusy ? <Loader2 size={12} className="animate-spin" /> : <Tag size={12} />}
+              Publish {selected.size} to eBay
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="table-wrap">
         <table className="w-full text-sm">
           <thead className="bg-panel2">
             <tr>
+              {!compact && (
+                <th className="th w-8">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all unpublished"
+                    checked={allSelected}
+                    onChange={(e) => {
+                      if (e.target.checked) selectAllUnpublished();
+                      else setSelected(new Set());
+                    }}
+                    className="h-4 w-4 accent-accent"
+                  />
+                </th>
+              )}
               <th className="th">Product</th>
               <th className="th">Brand</th>
               <th className="th">Amazon</th>
@@ -146,6 +276,18 @@ export default function ProductsTable({
               const profit = computeNet(p.price, salePrice, settings);
               return (
                 <tr key={p.asin} className="border-t border-border">
+                  {!compact && (
+                    <td className="td">
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${p.asin}`}
+                        checked={selected.has(p.asin)}
+                        disabled={!!listing?.listing_url}
+                        onChange={() => toggleSelect(p.asin)}
+                        className="h-4 w-4 accent-accent disabled:opacity-30"
+                      />
+                    </td>
+                  )}
                   <td className="td">
                     <div className="flex items-center gap-3">
                       {p.images?.[0] && (
@@ -161,7 +303,30 @@ export default function ProductsTable({
                         <div className="line-clamp-1 max-w-md font-medium">
                           {p.title || p.asin}
                         </div>
-                        <div className="font-mono text-xs text-muted">{p.asin}</div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs text-muted">{p.asin}</span>
+                          {(veroMap[p.asin]?.length ?? 0) > 0 && (() => {
+                            const matches = veroMap[p.asin];
+                            const blocking = matches.some((m) => m.level === "block");
+                            const kws = matches.map((m) => m.keyword).join(", ");
+                            const tooltip = matches
+                              .map((m) => `${m.keyword} (${m.level}): ${m.reason || ""}`)
+                              .join("\n");
+                            return (
+                              <span
+                                title={tooltip}
+                                className={`badge inline-flex items-center gap-1 ${
+                                  blocking
+                                    ? "bg-red-500/15 text-red-300"
+                                    : "bg-yellow-500/15 text-yellow-300"
+                                }`}
+                              >
+                                <ShieldAlert size={11} />
+                                VeRO · {kws}
+                              </span>
+                            );
+                          })()}
+                        </div>
                       </div>
                     </div>
                   </td>

@@ -166,6 +166,20 @@ export function computeNet(
   };
 }
 
+export type VeroMatch = {
+  keyword: string;
+  reason: string | null;
+  level: "block" | "warn";
+};
+
+export type VeroBrand = {
+  id: number;
+  keyword: string;
+  reason: string | null;
+  level: "block" | "warn";
+  created_at: string;
+};
+
 export type OutboundMessage = {
   id: number;
   ebay_order_id: string;

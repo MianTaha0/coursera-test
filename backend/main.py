@@ -81,6 +81,59 @@ app.add_middleware(
 #                        {tracking_number} {carrier} {seller_name}
 #                        {est_delivery_date}
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Default VeRO brand watchlist (Verified Rights Owner programs publicly known
+# for aggressive enforcement on eBay / dropshipping). Sellers can add or
+# remove entries via /api/vero/brands.
+#   keyword: substring matched case-insensitively against title + brand
+#   reason:  short human-readable explanation
+#   level:   "block" (refuse to publish) or "warn" (just badge it)
+# ---------------------------------------------------------------------------
+DEFAULT_VERO_BRANDS: list[tuple[str, str, str]] = [
+    ("apple", "Apple — VeRO IP holder, frequent takedowns", "block"),
+    ("airpods", "Apple AirPods — high-risk", "block"),
+    ("nike", "Nike — VeRO IP holder", "block"),
+    ("adidas", "Adidas — VeRO IP holder", "block"),
+    ("yeezy", "Adidas Yeezy", "block"),
+    ("supreme", "Supreme — VeRO IP holder", "block"),
+    ("disney", "Disney — VeRO IP holder", "block"),
+    ("marvel", "Marvel / Disney IP", "block"),
+    ("star wars", "Lucasfilm / Disney IP", "block"),
+    ("pokemon", "Pokémon Company / Nintendo", "block"),
+    ("pokémon", "Pokémon Company / Nintendo", "block"),
+    ("nintendo", "Nintendo — VeRO IP holder", "block"),
+    ("sony", "Sony — VeRO IP holder", "warn"),
+    ("microsoft", "Microsoft — VeRO IP holder", "warn"),
+    ("xbox", "Microsoft Xbox", "block"),
+    ("playstation", "Sony PlayStation", "block"),
+    ("louis vuitton", "Louis Vuitton — luxury VeRO", "block"),
+    ("gucci", "Gucci — luxury VeRO", "block"),
+    ("chanel", "Chanel — luxury VeRO", "block"),
+    ("hermes", "Hermès — luxury VeRO", "block"),
+    ("hermès", "Hermès — luxury VeRO", "block"),
+    ("rolex", "Rolex — VeRO IP holder", "block"),
+    ("cartier", "Cartier — luxury VeRO", "block"),
+    ("tiffany", "Tiffany & Co — VeRO IP holder", "block"),
+    ("burberry", "Burberry — VeRO IP holder", "block"),
+    ("prada", "Prada — VeRO IP holder", "block"),
+    ("versace", "Versace — VeRO IP holder", "block"),
+    ("ralph lauren", "Ralph Lauren — VeRO IP holder", "warn"),
+    ("calvin klein", "Calvin Klein — VeRO IP holder", "warn"),
+    ("tommy hilfiger", "Tommy Hilfiger — VeRO IP holder", "warn"),
+    ("coach", "Coach — VeRO IP holder", "warn"),
+    ("lego", "LEGO — VeRO IP holder", "block"),
+    ("nfl", "NFL — license required", "block"),
+    ("nba", "NBA — license required", "block"),
+    ("mlb", "MLB — license required", "block"),
+    ("harry potter", "Warner Bros / Wizarding World", "block"),
+    ("beats by dre", "Beats by Dre / Apple", "block"),
+    ("bose", "Bose — VeRO IP holder", "warn"),
+    ("fitbit", "Fitbit / Google", "warn"),
+    ("tesla", "Tesla — VeRO IP holder", "warn"),
+    ("dyson", "Dyson — VeRO IP holder", "warn"),
+]
+
+
 DEFAULT_MESSAGE_TEMPLATES: list[tuple[str, str, str, str, str]] = [
     (
         "order_confirmed",
@@ -245,6 +298,27 @@ def init_db() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_order ON fulfillment_attempts(ebay_order_id, started_at DESC)")
+
+        # VeRO (Verified Rights Owner) brand watchlist — flags products before
+        # they get listed and risk an account suspension.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vero_brands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT UNIQUE NOT NULL,
+                reason TEXT,
+                level TEXT NOT NULL DEFAULT 'block',
+                created_at TEXT NOT NULL
+            )
+        """)
+        existing = conn.execute("SELECT COUNT(*) AS c FROM vero_brands").fetchone()["c"]
+        if existing == 0:
+            now = datetime.now(timezone.utc).isoformat()
+            for keyword, reason, level in DEFAULT_VERO_BRANDS:
+                conn.execute(
+                    """INSERT INTO vero_brands (keyword, reason, level, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (keyword.lower(), reason, level, now),
+                )
 
         # Outbound buyer messages (queued by event triggers, sent manually for now)
         conn.execute("""
@@ -667,6 +741,7 @@ class ListEbayIn(BaseModel):
     fulfillment_policy_id: Optional[str] = None
     payment_policy_id: Optional[str] = None
     return_policy_id: Optional[str] = None
+    override_vero: bool = False            # bypass VeRO blocklist (use carefully)
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +877,39 @@ def ebay_disconnect():
 # ---------------------------------------------------------------------------
 # Routes — eBay listing
 # ---------------------------------------------------------------------------
+class ListEbayBulkIn(BaseModel):
+    asins: list[str]
+    price: Optional[float] = None
+    quantity: int = 1
+    category_id: str = "139971"
+    marketplace_id: str = "EBAY_US"
+    override_vero: bool = False
+
+
+@app.post("/api/products/list-ebay-bulk")
+async def list_on_ebay_bulk(body: ListEbayBulkIn):
+    """Publish many products in sequence. Returns a per-asin result."""
+    if not body.asins:
+        raise HTTPException(400, "asins required")
+    results = []
+    for asin in body.asins:
+        try:
+            r = await list_on_ebay(asin, ListEbayIn(
+                price=body.price,
+                quantity=body.quantity,
+                category_id=body.category_id,
+                marketplace_id=body.marketplace_id,
+                override_vero=body.override_vero,
+            ))
+            results.append({"asin": asin, "ok": True, **r})
+        except HTTPException as e:
+            results.append({"asin": asin, "ok": False, "status": e.status_code, "detail": e.detail})
+        except Exception as e:
+            results.append({"asin": asin, "ok": False, "status": 500, "detail": str(e)[:200]})
+    success = sum(1 for r in results if r["ok"])
+    return {"total": len(results), "success": success, "failed": len(results) - success, "results": results}
+
+
 @app.post("/api/products/{asin}/list-ebay")
 async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
     """Publish a saved product to eBay via the Inventory API (3-step flow)."""
@@ -811,6 +919,23 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         raise HTTPException(404, "Product not found.")
 
     product = row_to_product(row)
+
+    # VeRO check — refuse to publish products matching a "block" entry unless
+    # the caller explicitly opts to override.
+    if not body.override_vero:
+        vero_matches = check_vero_for_text(product.get("title", ""), product.get("brand", ""))
+        blocking = [m for m in vero_matches if m["level"] == "block"]
+        if blocking:
+            kws = ", ".join(m["keyword"] for m in blocking)
+            raise HTTPException(
+                422,
+                {
+                    "error": "vero_blocked",
+                    "message": f"Blocked by VeRO watchlist: {kws}",
+                    "matches": vero_matches,
+                },
+            )
+
     token = await get_valid_token()
     content_language = "en-US" if body.marketplace_id == "EBAY_US" else "en-GB"
     headers = {
@@ -1318,6 +1443,33 @@ def _order_to_template_vars(order: sqlite3.Row) -> dict[str, str]:
     }
 
 
+def check_vero_for_text(title: str, brand: str) -> list[dict[str, Any]]:
+    """Return all VeRO matches for a product's title/brand."""
+    text = f"{title or ''} {brand or ''}".lower()
+    if not text.strip():
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT keyword, reason, level FROM vero_brands"
+        ).fetchall()
+    matches = []
+    for r in rows:
+        kw = r["keyword"]
+        if kw and kw.lower() in text:
+            matches.append({"keyword": kw, "reason": r["reason"], "level": r["level"]})
+    return matches
+
+
+def check_vero_for_asin(asin: str) -> list[dict[str, Any]]:
+    with db() as conn:
+        p = conn.execute(
+            "SELECT title, brand FROM products WHERE asin = ?", (asin,)
+        ).fetchone()
+    if not p:
+        return []
+    return check_vero_for_text(p["title"] or "", p["brand"] or "")
+
+
 def queue_buyer_message(
     *, ebay_order_id: str, trigger_event: str, template_slug: str
 ) -> Optional[int]:
@@ -1506,6 +1658,79 @@ def queue_message_for_order(order_id: str, payload: QueueIn):
             "SELECT * FROM outbound_messages WHERE id = ?", (msg_id,)
         ).fetchone()
     return dict(row) if row else {"id": msg_id}
+
+
+# ---------------------------------------------------------------------------
+# Routes — VeRO (Verified Rights Owner) brand watchlist
+# ---------------------------------------------------------------------------
+@app.get("/api/vero/brands")
+def list_vero_brands():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM vero_brands ORDER BY keyword ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+class VeroBrandIn(BaseModel):
+    keyword: str
+    reason: Optional[str] = ""
+    level: str = "block"  # block | warn
+
+
+@app.post("/api/vero/brands")
+def add_vero_brand(payload: VeroBrandIn):
+    if not payload.keyword.strip():
+        raise HTTPException(400, "keyword required")
+    if payload.level not in ("block", "warn"):
+        raise HTTPException(400, "level must be 'block' or 'warn'")
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        try:
+            cur = conn.execute(
+                """INSERT INTO vero_brands (keyword, reason, level, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (payload.keyword.strip().lower(), payload.reason or "", payload.level, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM vero_brands WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "keyword already exists")
+    return dict(row)
+
+
+@app.delete("/api/vero/brands/{brand_id}")
+def delete_vero_brand(brand_id: int):
+    with db() as conn:
+        cur = conn.execute("DELETE FROM vero_brands WHERE id = ?", (brand_id,))
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+@app.get("/api/vero/scan")
+def scan_all_vero():
+    """Return {asin: matches[]} for every saved product. Used by the Products UI."""
+    with db() as conn:
+        prods = conn.execute("SELECT asin, title, brand FROM products").fetchall()
+        brands = conn.execute("SELECT keyword, reason, level FROM vero_brands").fetchall()
+    out: dict[str, list[dict[str, Any]]] = {}
+    for p in prods:
+        text = f"{p['title'] or ''} {p['brand'] or ''}".lower()
+        if not text.strip():
+            continue
+        matches = []
+        for b in brands:
+            kw = b["keyword"]
+            if kw and kw in text:
+                matches.append({"keyword": kw, "reason": b["reason"], "level": b["level"]})
+        if matches:
+            out[p["asin"]] = matches
+    return out
+
+
+@app.get("/api/vero/check/{asin}")
+def check_vero(asin: str):
+    return {"matches": check_vero_for_asin(asin)}
 
 
 @app.get("/api/listings")
@@ -1811,6 +2036,7 @@ async def fulfill_order(order_id: str, body: FulfillIn = FulfillIn()):
         "tracking_number": result.tracking_number,
         "carrier": result.carrier,
         "error": result.error,
+        "notes": result.notes,
         "screenshot_path": result.screenshot_path,
     }
 
