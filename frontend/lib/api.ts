@@ -76,9 +76,25 @@ export type Order = {
   tracking_number: string | null;
   tracking_carrier: string | null;
   tracking_submitted_at: string | null;
+  tracking_status: string | null;          // unknown | in_transit | out_for_delivery | delivered | exception
+  tracking_status_text: string | null;
+  tracking_checked_at: string | null;
   created_at: string;
   synced_at: string | null;
 };
+
+export const CARRIER_TRACKING_URLS: Record<string, string> = {
+  USPS: "https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1={}",
+  UPS: "https://www.ups.com/track?tracknum={}",
+  FEDEX: "https://www.fedex.com/fedextrack/?tracknumbers={}",
+  DHL: "https://www.dhl.com/global-en/home/tracking/tracking-parcel.html?submit=1&tracking-id={}",
+};
+
+export function carrierTrackingUrl(carrier: string | null | undefined, num: string | null | undefined): string | null {
+  if (!carrier || !num) return null;
+  const tpl = CARRIER_TRACKING_URLS[carrier.toUpperCase()];
+  return tpl ? tpl.replace("{}", num) : null;
+}
 
 export type PriceSnapshot = {
   price: number | null;

@@ -13,8 +13,10 @@ import {
   Bot,
   Mail,
   Trash2,
+  PackageCheck,
+  PackageSearch,
 } from "lucide-react";
-import { api, Order, OutboundMessage } from "@/lib/api";
+import { api, Order, OutboundMessage, carrierTrackingUrl } from "@/lib/api";
 import { money, date } from "@/lib/format";
 
 const CARRIERS = ["USPS", "FEDEX", "UPS", "DHL"];
@@ -32,6 +34,7 @@ export default function OrdersPage() {
   }>({ tracking_number: "", carrier: "USPS" });
   const [submitting, setSubmitting] = useState(false);
   const [fulfilling, setFulfilling] = useState<string | null>(null);
+  const [trackingBusy, setTrackingBusy] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -80,6 +83,56 @@ export default function OrdersPage() {
       flash("Address copied");
     } catch {
       flash("Could not copy");
+    }
+  }
+
+  async function refreshTracking(o: Order) {
+    setTrackingBusy(o.ebay_order_id);
+    try {
+      const res = await api<{ status: string; status_text: string }>(
+        `/api/orders/${encodeURIComponent(o.ebay_order_id)}/tracking/refresh`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      flash(`Status: ${res.status} — ${res.status_text}`);
+      await load();
+    } catch (e: any) {
+      flash(`Failed: ${e.message}`);
+    } finally {
+      setTrackingBusy(null);
+    }
+  }
+
+  async function markDelivered(o: Order) {
+    setTrackingBusy(o.ebay_order_id);
+    try {
+      await api(
+        `/api/orders/${encodeURIComponent(o.ebay_order_id)}/tracking/mark-delivered`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      flash("Marked delivered — delivered template queued");
+      await load();
+    } catch (e: any) {
+      flash(`Failed: ${e.message}`);
+    } finally {
+      setTrackingBusy(null);
+    }
+  }
+
+  async function refreshAllTracking() {
+    setSyncing(true);
+    try {
+      const res = await api<{ refreshed: number; delivered_now: number }>(
+        "/api/orders/refresh-all-tracking",
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      flash(
+        `Refreshed ${res.refreshed} orders${res.delivered_now ? ` · ${res.delivered_now} now delivered` : ""}`,
+      );
+      await load();
+    } catch (e: any) {
+      flash(`Failed: ${e.message}`);
+    } finally {
+      setSyncing(false);
     }
   }
 
@@ -149,10 +202,21 @@ export default function OrdersPage() {
             Amazon and push tracking back to eBay.
           </p>
         </div>
-        <button onClick={syncFromEbay} disabled={syncing} className="btn-primary">
-          {syncing ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-          Sync from eBay
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={refreshAllTracking}
+            disabled={syncing}
+            className="btn-secondary"
+            title="Refresh tracking status for all shipped orders"
+          >
+            {syncing ? <Loader2 size={14} className="animate-spin" /> : <PackageSearch size={14} />}
+            Refresh tracking
+          </button>
+          <button onClick={syncFromEbay} disabled={syncing} className="btn-primary">
+            {syncing ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+            Sync from eBay
+          </button>
+        </div>
       </div>
 
       {flashMsg && (
@@ -285,11 +349,74 @@ export default function OrdersPage() {
                       <div>
                         <h4 className="text-xs uppercase text-muted">Tracking</h4>
                         {o.tracking_number ? (
-                          <div className="mt-1 text-sm">
-                            <div className="font-mono">{o.tracking_number}</div>
-                            <div className="text-xs text-muted">
-                              {o.tracking_carrier} · submitted{" "}
-                              {o.tracking_submitted_at ? date(o.tracking_submitted_at) : ""}
+                          <div className="mt-1 space-y-2 text-sm">
+                            <div>
+                              <div className="font-mono">{o.tracking_number}</div>
+                              <div className="text-xs text-muted">
+                                {o.tracking_carrier} · submitted{" "}
+                                {o.tracking_submitted_at ? date(o.tracking_submitted_at) : ""}
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span
+                                className={`badge ${
+                                  o.tracking_status === "delivered"
+                                    ? "bg-accent/15 text-accent"
+                                    : o.tracking_status === "exception"
+                                    ? "bg-red-500/15 text-red-300"
+                                    : o.tracking_status === "out_for_delivery"
+                                    ? "bg-yellow-500/15 text-yellow-300"
+                                    : o.tracking_status === "in_transit"
+                                    ? "bg-blue-500/15 text-blue-300"
+                                    : "bg-panel text-muted"
+                                }`}
+                              >
+                                {o.tracking_status === "delivered" && <PackageCheck size={11} />}
+                                {(o.tracking_status || "unknown").replace("_", " ")}
+                              </span>
+                              {o.tracking_status_text && (
+                                <span className="text-xs text-muted truncate" title={o.tracking_status_text}>
+                                  {o.tracking_status_text}
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {(() => {
+                                const url = carrierTrackingUrl(o.tracking_carrier, o.tracking_number);
+                                return url ? (
+                                  <a
+                                    href={url}
+                                    target="_blank"
+                                    rel="noopener"
+                                    className="btn-secondary text-xs"
+                                  >
+                                    <ExternalLink size={12} /> Track on {o.tracking_carrier}
+                                  </a>
+                                ) : null;
+                              })()}
+                              <button
+                                onClick={() => refreshTracking(o)}
+                                disabled={trackingBusy === o.ebay_order_id}
+                                className="btn-secondary text-xs"
+                                title="Re-check status (no carrier API configured yet — see backend/main.py)"
+                              >
+                                {trackingBusy === o.ebay_order_id ? (
+                                  <Loader2 size={12} className="animate-spin" />
+                                ) : (
+                                  <RefreshCw size={12} />
+                                )}
+                                Refresh
+                              </button>
+                              {o.tracking_status !== "delivered" && (
+                                <button
+                                  onClick={() => markDelivered(o)}
+                                  disabled={trackingBusy === o.ebay_order_id}
+                                  className="btn-primary text-xs"
+                                  title="Manually mark as delivered (queues delivered buyer message)"
+                                >
+                                  <PackageCheck size={12} /> Mark delivered
+                                </button>
+                              )}
                             </div>
                           </div>
                         ) : (

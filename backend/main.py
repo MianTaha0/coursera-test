@@ -203,6 +203,17 @@ def db():
 
 def init_db() -> None:
     with db() as conn:
+        # Migrate orders schema additively for tracking_status if needed
+        cur = conn.execute("PRAGMA table_info(orders)").fetchall()
+        if cur:
+            cols = {c["name"] for c in cur}
+            if "tracking_status" not in cols:
+                conn.execute("ALTER TABLE orders ADD COLUMN tracking_status TEXT")
+            if "tracking_status_text" not in cols:
+                conn.execute("ALTER TABLE orders ADD COLUMN tracking_status_text TEXT")
+            if "tracking_checked_at" not in cols:
+                conn.execute("ALTER TABLE orders ADD COLUMN tracking_checked_at TEXT")
+
         # Migrate the old orders schema (auto-incrementing id) → new ebay_order_id PK
         cur = conn.execute("PRAGMA table_info(orders)").fetchall()
         if cur and not any(c["name"] == "ebay_order_id" for c in cur):
@@ -1446,6 +1457,81 @@ def _order_to_template_vars(order: sqlite3.Row) -> dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Tracking-status checker
+#
+# Real carrier APIs (USPS Web Tools, UPS, FedEx, DHL) all require credentials
+# we don't have. EasyPost / AfterShip aggregate them but also need keys. So
+# this is a deliberately-simple plug point: today it returns "unknown" for
+# every lookup, which means the operator must mark orders as delivered
+# manually. To wire in a real provider, replace `_lookup_status_remote()`
+# below — the rest of the pipeline (refresh endpoint, delivered template
+# trigger, status persistence) already works.
+# ---------------------------------------------------------------------------
+CARRIER_TRACKING_URLS = {
+    "USPS": "https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1={}",
+    "UPS":  "https://www.ups.com/track?tracknum={}",
+    "FEDEX": "https://www.fedex.com/fedextrack/?tracknumbers={}",
+    "DHL":  "https://www.dhl.com/global-en/home/tracking/tracking-parcel.html?submit=1&tracking-id={}",
+}
+
+
+def carrier_tracking_url(carrier: Optional[str], number: Optional[str]) -> Optional[str]:
+    if not carrier or not number:
+        return None
+    template = CARRIER_TRACKING_URLS.get(carrier.upper())
+    return template.format(number) if template else None
+
+
+async def _lookup_status_remote(carrier: str, number: str) -> tuple[str, str]:
+    """Plug an external tracking API in here. Returns (status, status_text).
+
+    Recognised statuses: in_transit | out_for_delivery | delivered |
+                         exception | returned | unknown
+    """
+    return ("unknown", "Tracking API not configured.")
+
+
+async def refresh_tracking_for_order(order_id: str) -> dict[str, Any]:
+    """Fetch latest tracking status, persist it, fire the delivered template."""
+    with db() as conn:
+        order = conn.execute(
+            "SELECT * FROM orders WHERE ebay_order_id = ?", (order_id,)
+        ).fetchone()
+    if not order:
+        raise HTTPException(404, "order not found")
+    if not order["tracking_number"]:
+        raise HTTPException(400, "order has no tracking number yet")
+
+    carrier = order["tracking_carrier"] or ""
+    number = order["tracking_number"]
+    new_status, status_text = await _lookup_status_remote(carrier, number)
+    now = datetime.now(timezone.utc).isoformat()
+
+    with db() as conn:
+        conn.execute(
+            """UPDATE orders SET tracking_status = ?, tracking_status_text = ?,
+                                  tracking_checked_at = ?
+               WHERE ebay_order_id = ?""",
+            (new_status, status_text, now, order_id),
+        )
+
+    if new_status == "delivered" and order["tracking_status"] != "delivered":
+        queue_buyer_message(
+            ebay_order_id=order_id,
+            trigger_event="tracking_delivered",
+            template_slug="delivered",
+        )
+
+    return {
+        "ok": True,
+        "status": new_status,
+        "status_text": status_text,
+        "checked_at": now,
+        "tracking_url": carrier_tracking_url(carrier, number),
+    }
+
+
 def check_vero_for_text(title: str, brand: str) -> list[dict[str, Any]]:
     """Return all VeRO matches for a product's title/brand."""
     text = f"{title or ''} {brand or ''}".lower()
@@ -1955,7 +2041,64 @@ def get_order(order_id: str):
         ).fetchone()
     if not row:
         raise HTTPException(404, "order not found")
-    return dict(row)
+    out = dict(row)
+    out["tracking_url"] = carrier_tracking_url(row["tracking_carrier"], row["tracking_number"])
+    return out
+
+
+@app.post("/api/orders/{order_id}/tracking/refresh")
+async def refresh_one_tracking(order_id: str):
+    return await refresh_tracking_for_order(order_id)
+
+
+@app.post("/api/orders/refresh-all-tracking")
+async def refresh_all_tracking():
+    """Refresh tracking for every order with a tracking number that isn't already delivered."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT ebay_order_id FROM orders "
+            "WHERE tracking_number IS NOT NULL AND tracking_number != '' "
+            "  AND (tracking_status IS NULL OR tracking_status != 'delivered')"
+        ).fetchall()
+    refreshed = 0
+    delivered_now = 0
+    for r in rows:
+        try:
+            res = await refresh_tracking_for_order(r["ebay_order_id"])
+            refreshed += 1
+            if res.get("status") == "delivered":
+                delivered_now += 1
+        except Exception:
+            continue
+    return {"ok": True, "refreshed": refreshed, "delivered_now": delivered_now}
+
+
+@app.post("/api/orders/{order_id}/tracking/mark-delivered")
+def mark_order_delivered(order_id: str):
+    """Manual override — useful when no carrier API is wired up. Auto-queues
+    the `delivered` buyer message."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT tracking_status FROM orders WHERE ebay_order_id = ?", (order_id,)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "order not found")
+        was_delivered = existing["tracking_status"] == "delivered"
+        conn.execute(
+            """UPDATE orders SET tracking_status = 'delivered',
+                                  tracking_status_text = 'Marked as delivered manually',
+                                  tracking_checked_at = ?
+               WHERE ebay_order_id = ?""",
+            (now, order_id),
+        )
+    if not was_delivered:
+        queue_buyer_message(
+            ebay_order_id=order_id,
+            trigger_event="manually_delivered",
+            template_slug="delivered",
+        )
+    return {"ok": True, "status": "delivered"}
 
 
 # ---------------------------------------------------------------------------
