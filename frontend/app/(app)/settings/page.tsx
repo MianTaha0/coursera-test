@@ -6,58 +6,92 @@ import { api, API_URL, AppSettings, computeNet } from "@/lib/api";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 
-type EbayStatus = {
+type EbayAccount = {
+  id: number;
+  label: string;
+  sandbox: boolean;
+  is_active: boolean;
   connected: boolean;
-  token_valid?: boolean;
-  token_expires_at?: number;
-  connected_at?: string;
-  sandbox?: boolean;
+  token_valid: boolean;
+  refresh_valid: boolean;
+  token_connected_at: string | null;
+  expires_at: number | null;
+  created_at: string;
 };
 
 function EbaySection() {
   const params = useSearchParams();
-  const [status, setStatus] = useState<EbayStatus | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [accounts, setAccounts] = useState<EbayAccount[] | null>(null);
+  const [busy, setBusy] = useState<number | null>(null);
   const [flashMsg, setFlashMsg] = useState<string | null>(null);
+  const [newLabel, setNewLabel] = useState("");
 
   async function load() {
     try {
-      const s = await api<EbayStatus>("/auth/ebay/status");
-      setStatus(s);
+      const a = await api<EbayAccount[]>("/api/ebay/accounts");
+      setAccounts(a);
     } catch {
-      setStatus({ connected: false });
+      setAccounts([]);
     }
   }
 
   useEffect(() => {
     load();
     if (params.get("ebay") === "connected") {
-      setFlashMsg("eBay connected successfully!");
+      setFlashMsg("eBay account connected successfully!");
       window.history.replaceState({}, "", "/settings");
     }
   }, [params]);
 
-  async function disconnect() {
-    if (!confirm("Disconnect your eBay account?")) return;
-    setBusy(true);
+  async function activate(id: number) {
+    setBusy(id);
     try {
-      await api("/auth/ebay", { method: "DELETE" });
+      await api(`/api/ebay/accounts/${id}/activate`, { method: "POST" });
       await load();
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
-  const connectUrl = `${API_URL}/auth/ebay`;
+  async function rename(id: number, current: string) {
+    const label = prompt("Rename store", current);
+    if (!label || label === current) return;
+    setBusy(id);
+    try {
+      await api(`/api/ebay/accounts/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({ label }),
+      });
+      await load();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove(id: number, label: string) {
+    if (!confirm(`Delete "${label}"? Tokens for this account will be discarded.`)) return;
+    setBusy(id);
+    try {
+      await api(`/api/ebay/accounts/${id}`, { method: "DELETE" });
+      await load();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const addUrl = newLabel.trim()
+    ? `${API_URL}/auth/ebay?label=${encodeURIComponent(newLabel.trim())}`
+    : `${API_URL}/auth/ebay`;
 
   return (
     <div className="card">
       <div className="flex items-center gap-3">
         <Store size={20} className="text-muted" />
-        <h2 className="text-lg font-semibold">eBay Account</h2>
-        {status?.sandbox && (
-          <span className="badge bg-yellow-500/15 text-yellow-400">Sandbox</span>
-        )}
+        <h2 className="text-lg font-semibold">eBay Accounts</h2>
+        <span className="badge bg-yellow-500/15 text-yellow-400">Sandbox</span>
+        <span className="ml-auto text-xs text-muted">
+          {accounts?.length ?? 0} connected
+        </span>
       </div>
 
       {flashMsg && (
@@ -66,55 +100,106 @@ function EbaySection() {
         </div>
       )}
 
-      <div className="mt-4">
-        {status === null ? (
-          <div className="flex items-center gap-2 text-sm text-muted">
-            <Loader2 size={16} className="animate-spin" /> Checking connection…
-          </div>
-        ) : status.connected ? (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-accent">
-              <CheckCircle2 size={18} />
-              <span className="font-medium">Connected</span>
-              {status.token_valid === false && (
-                <span className="flex items-center gap-1 text-yellow-400">
-                  <AlertTriangle size={14} /> Token expired — reconnect below
-                </span>
+      <p className="mt-2 text-sm text-muted">
+        Connect multiple eBay seller accounts. Operations like Publish, Sync,
+        and List use the <b>active</b> account. Switch the active store any time.
+      </p>
+
+      {accounts === null ? (
+        <div className="mt-4 flex items-center gap-2 text-sm text-muted">
+          <Loader2 size={16} className="animate-spin" /> Loading accounts…
+        </div>
+      ) : accounts.length === 0 ? (
+        <div className="mt-4 rounded-lg border border-dashed border-border bg-panel2 p-6 text-center text-sm text-muted">
+          No eBay accounts connected yet.
+        </div>
+      ) : (
+        <ul className="mt-4 space-y-2">
+          {accounts.map((a) => (
+            <li
+              key={a.id}
+              className={`rounded-lg border p-3 ${
+                a.is_active
+                  ? "border-accent/40 bg-accent/5"
+                  : "border-border bg-panel2"
+              }`}
+            >
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <span className="font-medium truncate">{a.label}</span>
+                  {a.is_active && (
+                    <span className="badge bg-accent/15 text-accent">Active</span>
+                  )}
+                  {a.sandbox && (
+                    <span className="badge bg-yellow-500/15 text-yellow-400">Sandbox</span>
+                  )}
+                  {!a.connected ? (
+                    <span className="badge bg-red-500/15 text-red-300">Not connected</span>
+                  ) : a.token_valid ? (
+                    <span className="badge bg-blue-500/15 text-blue-300">Connected</span>
+                  ) : (
+                    <span className="badge bg-yellow-500/15 text-yellow-300">
+                      <AlertTriangle size={11} /> Token expired
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {!a.is_active && a.connected && (
+                    <button
+                      onClick={() => activate(a.id)}
+                      disabled={busy === a.id}
+                      className="btn-secondary text-xs"
+                    >
+                      {busy === a.id ? <Loader2 size={12} className="animate-spin" /> : null}
+                      Make active
+                    </button>
+                  )}
+                  <a
+                    href={`${API_URL}/auth/ebay?account_id=${a.id}`}
+                    className="btn-secondary text-xs"
+                  >
+                    {a.connected ? "Reconnect" : "Connect"}
+                  </a>
+                  <button
+                    onClick={() => rename(a.id, a.label)}
+                    disabled={busy === a.id}
+                    className="btn-secondary text-xs"
+                  >
+                    Rename
+                  </button>
+                  <button
+                    onClick={() => remove(a.id, a.label)}
+                    disabled={busy === a.id}
+                    className="btn-danger text-xs"
+                  >
+                    <LogOut size={12} />
+                  </button>
+                </div>
+              </div>
+              {a.token_connected_at && (
+                <div className="mt-1 text-xs text-muted">
+                  Connected {new Date(a.token_connected_at).toLocaleString()}
+                </div>
               )}
-            </div>
-            {status.connected_at && (
-              <p className="text-xs text-muted">
-                Connected {new Date(status.connected_at).toLocaleString()}
-              </p>
-            )}
-            <div className="flex gap-2">
-              <a href={connectUrl} className="btn-secondary text-sm">
-                Reconnect
-              </a>
-              <button
-                onClick={disconnect}
-                disabled={busy}
-                className="btn-danger text-sm"
-              >
-                {busy ? <Loader2 size={14} className="animate-spin" /> : <LogOut size={14} />}
-                Disconnect
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-muted">
-              <XCircle size={18} className="text-red-400" />
-              <span>Not connected</span>
-            </div>
-            <p className="text-sm text-muted">
-              Connect your eBay seller account to publish products directly from the Products page.
-            </p>
-            <a href={connectUrl} className="btn-primary inline-flex">
-              <Store size={16} /> Connect eBay
-            </a>
-          </div>
-        )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="mt-4 rounded-lg border border-border bg-panel2 p-3">
+        <div className="text-xs uppercase text-muted">Add another store</div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <input
+            type="text"
+            value={newLabel}
+            onChange={(e) => setNewLabel(e.target.value)}
+            placeholder="Store label (e.g. 'Main UK store')"
+            className="input flex-1 text-sm"
+          />
+          <a href={addUrl} className="btn-primary text-sm">
+            <Store size={14} /> Connect new eBay account
+          </a>
+        </div>
       </div>
 
       <div className="mt-4 rounded-lg border border-border bg-panel2 p-3 text-xs text-muted space-y-1">
@@ -122,7 +207,7 @@ function EbaySection() {
         <p>1. In the <a href="https://developer.ebay.com/my/keys" target="_blank" rel="noopener" className="text-accent hover:underline">eBay Developer Portal</a>, copy your <b>App ID</b> and <b>Cert ID</b>.</p>
         <p>2. Set <code>EBAY_CLIENT_ID</code>, <code>EBAY_CLIENT_SECRET</code>, and <code>EBAY_RU_NAME</code> in your backend environment.</p>
         <p>3. Update the <b>Auth accepted URL</b> in your eBay app to <code>{API_URL}/auth/ebay/callback</code>.</p>
-        <p>4. Click <b>Connect eBay</b> above.</p>
+        <p>4. Use the form above to add stores. Each store goes through its own OAuth consent.</p>
       </div>
     </div>
   );

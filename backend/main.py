@@ -386,18 +386,70 @@ def init_db() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_asin ON price_history(asin, checked_at DESC)")
 
-        # Single-row table: stores the active eBay OAuth tokens
+        # eBay seller accounts ("stores"). One row per connected eBay account.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ebay_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                sandbox INTEGER NOT NULL DEFAULT 1,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # Per-account OAuth tokens. Replaces the old single-row ebay_tokens table.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ebay_tokens (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
+                account_id INTEGER PRIMARY KEY,
                 access_token TEXT,
                 refresh_token TEXT,
                 expires_at INTEGER,
                 refresh_expires_at INTEGER,
                 scope TEXT,
-                connected_at TEXT
+                connected_at TEXT,
+                FOREIGN KEY (account_id) REFERENCES ebay_accounts(id) ON DELETE CASCADE
             )
         """)
+
+        # Migrate from the old single-row tokens table (id=1) → first account row.
+        try:
+            old = conn.execute(
+                "SELECT * FROM ebay_tokens WHERE account_id IS NULL OR account_id = 1"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            old = []
+        cols = {c["name"] for c in conn.execute("PRAGMA table_info(ebay_tokens)").fetchall()}
+        if "id" in cols and "account_id" not in cols:
+            # Old schema (id PK). Pull the legacy row, then rebuild the table.
+            legacy_rows = conn.execute("SELECT * FROM ebay_tokens").fetchall()
+            conn.execute("DROP TABLE ebay_tokens")
+            conn.execute("""
+                CREATE TABLE ebay_tokens (
+                    account_id INTEGER PRIMARY KEY,
+                    access_token TEXT,
+                    refresh_token TEXT,
+                    expires_at INTEGER,
+                    refresh_expires_at INTEGER,
+                    scope TEXT,
+                    connected_at TEXT
+                )
+            """)
+            now = datetime.now(timezone.utc).isoformat()
+            if legacy_rows:
+                # Create the default account (id=1) and copy the legacy tokens.
+                conn.execute(
+                    """INSERT INTO ebay_accounts (id, label, sandbox, is_active, created_at)
+                       VALUES (1, 'Default account', ?, 1, ?)""",
+                    (1 if EBAY_SANDBOX else 0, now),
+                )
+                lr = legacy_rows[0]
+                conn.execute(
+                    """INSERT INTO ebay_tokens (account_id, access_token, refresh_token,
+                       expires_at, refresh_expires_at, scope, connected_at)
+                       VALUES (1, ?, ?, ?, ?, ?, ?)""",
+                    (lr["access_token"], lr["refresh_token"], lr["expires_at"],
+                     lr["refresh_expires_at"], lr["scope"], lr["connected_at"]),
+                )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_products_saved_at ON products(saved_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
 
@@ -418,20 +470,68 @@ def row_to_product(r: sqlite3.Row) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Helpers — eBay tokens
+# Helpers — eBay accounts + tokens (multi-store)
 # ---------------------------------------------------------------------------
-def _token_row(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
-    return conn.execute("SELECT * FROM ebay_tokens WHERE id = 1").fetchone()
+def get_active_account_id() -> Optional[int]:
+    with db() as conn:
+        r = conn.execute(
+            "SELECT id FROM ebay_accounts WHERE is_active = 1 LIMIT 1"
+        ).fetchone()
+        if r:
+            return r["id"]
+        # Fall back to lowest-id account if none flagged active
+        r = conn.execute("SELECT id FROM ebay_accounts ORDER BY id ASC LIMIT 1").fetchone()
+        return r["id"] if r else None
 
 
-def _save_tokens(conn: sqlite3.Connection, data: dict) -> None:
+def set_active_account_id(account_id: int) -> None:
+    with db() as conn:
+        conn.execute("UPDATE ebay_accounts SET is_active = 0")
+        conn.execute("UPDATE ebay_accounts SET is_active = 1 WHERE id = ?", (account_id,))
+
+
+def list_accounts_with_status() -> list[dict[str, Any]]:
+    """Used by /api/ebay/accounts. Joins tokens to surface connection state."""
+    now = int(time.time())
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT a.*, t.access_token, t.expires_at, t.refresh_expires_at,
+                      t.connected_at AS token_connected_at
+               FROM ebay_accounts a
+               LEFT JOIN ebay_tokens t ON t.account_id = a.id
+               ORDER BY a.id ASC"""
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["connected"] = bool(d.get("access_token"))
+        d["token_valid"] = bool(d.get("access_token") and (d.get("expires_at") or 0) > now)
+        d["refresh_valid"] = bool(d.get("refresh_token") if False else (d.get("refresh_expires_at") or 0) > now)
+        d["sandbox"] = bool(d.get("sandbox"))
+        d["is_active"] = bool(d.get("is_active"))
+        # Don't leak the access token
+        d.pop("access_token", None)
+        out.append(d)
+    return out
+
+
+def _token_row(conn: sqlite3.Connection, account_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+    aid = account_id if account_id is not None else get_active_account_id()
+    if aid is None:
+        return None
+    return conn.execute(
+        "SELECT * FROM ebay_tokens WHERE account_id = ?", (aid,)
+    ).fetchone()
+
+
+def _save_tokens(conn: sqlite3.Connection, data: dict, account_id: int) -> None:
     expires_at = int(time.time()) + int(data.get("expires_in", 7200))
     refresh_expires_at = int(time.time()) + int(data.get("refresh_token_expires_in", 47304000))
     conn.execute(
         """
-        INSERT INTO ebay_tokens (id, access_token, refresh_token, expires_at, refresh_expires_at, scope, connected_at)
-        VALUES (1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        INSERT INTO ebay_tokens (account_id, access_token, refresh_token, expires_at, refresh_expires_at, scope, connected_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(account_id) DO UPDATE SET
             access_token=excluded.access_token,
             refresh_token=excluded.refresh_token,
             expires_at=excluded.expires_at,
@@ -440,6 +540,7 @@ def _save_tokens(conn: sqlite3.Connection, data: dict) -> None:
             connected_at=excluded.connected_at
         """,
         (
+            account_id,
             data["access_token"],
             data.get("refresh_token", ""),
             expires_at,
@@ -709,12 +810,15 @@ async def ensure_business_policies(headers: dict, marketplace_id: str) -> dict:
     return out
 
 
-async def get_valid_token() -> str:
-    """Return a valid access token, refreshing if needed."""
+async def get_valid_token(account_id: Optional[int] = None) -> str:
+    """Return a valid access token for the given (or active) account."""
+    aid = account_id if account_id is not None else get_active_account_id()
+    if aid is None:
+        raise HTTPException(401, "No eBay account connected. Go to Settings → Connect eBay.")
     with db() as conn:
-        row = _token_row(conn)
-        if not row:
-            raise HTTPException(401, "eBay not connected. Go to Settings → Connect eBay.")
+        row = _token_row(conn, aid)
+        if not row or not row["access_token"]:
+            raise HTTPException(401, "eBay not connected for the active account. Go to Settings → Connect eBay.")
         now = int(time.time())
         if now < row["expires_at"] - 60:
             return row["access_token"]
@@ -723,7 +827,7 @@ async def get_valid_token() -> str:
             raise HTTPException(401, "eBay token expired and no refresh token. Please reconnect.")
         data = await _refresh_access_token(row["refresh_token"])
         with db() as conn2:
-            _save_tokens(conn2, data)
+            _save_tokens(conn2, data, aid)
         return data["access_token"]
 
 
@@ -806,13 +910,46 @@ eBay account data with any third party.</p>
 _oauth_states: dict[str, float] = {}
 
 
+def _ensure_pending_account(label: str) -> int:
+    """Create or reuse a pending (no-tokens-yet) account row, return its id."""
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        # Reuse an existing token-less account with the same label, if any
+        existing = conn.execute(
+            """SELECT a.id FROM ebay_accounts a
+               LEFT JOIN ebay_tokens t ON t.account_id = a.id
+               WHERE a.label = ? AND t.access_token IS NULL""",
+            (label,),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        cur = conn.execute(
+            """INSERT INTO ebay_accounts (label, sandbox, is_active, created_at)
+               VALUES (?, ?, 0, ?)""",
+            (label, 1 if EBAY_SANDBOX else 0, now),
+        )
+        return cur.lastrowid
+
+
 @app.get("/auth/ebay")
-def ebay_auth_start():
-    """Redirect the browser to eBay's OAuth consent screen."""
+def ebay_auth_start(account_id: Optional[int] = None, label: Optional[str] = None):
+    """Redirect the browser to eBay's OAuth consent screen.
+
+    If `account_id` is given, the resulting tokens are bound to that account
+    (used for re-connect). Otherwise a new pending account is created with
+    the supplied `label` (or "Store N" if no label).
+    """
     if not EBAY_CLIENT_ID or not EBAY_RU_NAME:
         raise HTTPException(500, "EBAY_CLIENT_ID and EBAY_RU_NAME env vars must be set.")
+
+    if account_id is None:
+        with db() as conn:
+            count = conn.execute("SELECT COUNT(*) AS c FROM ebay_accounts").fetchone()["c"]
+        chosen_label = (label or f"Store {count + 1}").strip() or f"Store {count + 1}"
+        account_id = _ensure_pending_account(chosen_label)
+
     state = secrets.token_urlsafe(16)
-    _oauth_states[state] = time.time()
+    _oauth_states[state] = (time.time(), account_id)
     params = urlencode({
         "client_id": EBAY_CLIENT_ID,
         "redirect_uri": EBAY_RU_NAME,
@@ -826,12 +963,17 @@ def ebay_auth_start():
 @app.get("/auth/ebay/callback")
 async def ebay_auth_callback(code: str = Query(...), state: str = Query(...)):
     """eBay redirects here after the user approves. Exchange code for tokens."""
-    # Validate state
     if state not in _oauth_states:
         raise HTTPException(400, "Invalid OAuth state. Try connecting again.")
-    age = time.time() - _oauth_states.pop(state)
-    if age > 300:
+    state_value = _oauth_states.pop(state)
+    if isinstance(state_value, tuple):
+        ts, account_id = state_value
+    else:
+        ts, account_id = state_value, None
+    if time.time() - ts > 300:
         raise HTTPException(400, "OAuth state expired. Try connecting again.")
+    if not account_id:
+        raise HTTPException(400, "OAuth state missing account binding. Try connecting again.")
 
     if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET or not EBAY_RU_NAME:
         raise HTTPException(500, "EBAY_CLIENT_ID / EBAY_CLIENT_SECRET / EBAY_RU_NAME not configured.")
@@ -854,21 +996,31 @@ async def ebay_auth_callback(code: str = Query(...), state: str = Query(...)):
         raise HTTPException(502, f"eBay token exchange failed: {r.text}")
 
     with db() as conn:
-        _save_tokens(conn, r.json())
+        _save_tokens(conn, r.json(), account_id)
+        # If no other account is currently active, promote this one
+        active = conn.execute(
+            "SELECT id FROM ebay_accounts WHERE is_active = 1"
+        ).fetchone()
+        if not active:
+            conn.execute("UPDATE ebay_accounts SET is_active = 1 WHERE id = ?", (account_id,))
 
     return RedirectResponse(f"{FRONTEND_URL}/settings?ebay=connected")
 
 
 @app.get("/auth/ebay/status")
 def ebay_status():
-    """Return current eBay connection status."""
-    with db() as conn:
-        row = _token_row(conn)
-    if not row:
+    """Return connection status for the currently-active account."""
+    aid = get_active_account_id()
+    if aid is None:
         return {"connected": False}
+    with db() as conn:
+        row = _token_row(conn, aid)
+    if not row or not row["access_token"]:
+        return {"connected": False, "active_account_id": aid}
     now = int(time.time())
     return {
         "connected": True,
+        "active_account_id": aid,
         "token_valid": now < row["expires_at"],
         "token_expires_at": row["expires_at"],
         "refresh_valid": now < row["refresh_expires_at"],
@@ -879,11 +1031,71 @@ def ebay_status():
 
 
 @app.delete("/auth/ebay")
-def ebay_disconnect():
-    """Remove stored eBay tokens."""
+def ebay_disconnect_active():
+    """Remove tokens for the currently-active account (legacy single-account API)."""
+    aid = get_active_account_id()
+    if aid is None:
+        return {"ok": True, "message": "Nothing connected."}
     with db() as conn:
-        conn.execute("DELETE FROM ebay_tokens WHERE id = 1")
+        conn.execute("DELETE FROM ebay_tokens WHERE account_id = ?", (aid,))
     return {"ok": True, "message": "eBay disconnected."}
+
+
+# ---------- Multi-account API ----------
+@app.get("/api/ebay/accounts")
+def api_list_accounts():
+    return list_accounts_with_status()
+
+
+class AccountIn(BaseModel):
+    label: str
+
+
+@app.put("/api/ebay/accounts/{account_id}")
+def api_update_account(account_id: int, payload: AccountIn):
+    with db() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM ebay_accounts WHERE id = ?", (account_id,)
+        ).fetchone():
+            raise HTTPException(404, "account not found")
+        conn.execute(
+            "UPDATE ebay_accounts SET label = ? WHERE id = ?",
+            (payload.label.strip() or "Untitled store", account_id),
+        )
+    return {"ok": True}
+
+
+@app.post("/api/ebay/accounts/{account_id}/activate")
+def api_activate_account(account_id: int):
+    with db() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM ebay_accounts WHERE id = ?", (account_id,)
+        ).fetchone():
+            raise HTTPException(404, "account not found")
+    set_active_account_id(account_id)
+    return {"ok": True, "active_account_id": account_id}
+
+
+@app.delete("/api/ebay/accounts/{account_id}")
+def api_delete_account(account_id: int):
+    with db() as conn:
+        was_active = conn.execute(
+            "SELECT is_active FROM ebay_accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        if not was_active:
+            raise HTTPException(404, "account not found")
+        conn.execute("DELETE FROM ebay_tokens WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM ebay_accounts WHERE id = ?", (account_id,))
+        # If we deleted the active one, promote the lowest remaining account
+        if was_active["is_active"]:
+            r = conn.execute(
+                "SELECT id FROM ebay_accounts ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if r:
+                conn.execute(
+                    "UPDATE ebay_accounts SET is_active = 1 WHERE id = ?", (r["id"],)
+                )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
