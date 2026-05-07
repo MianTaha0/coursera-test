@@ -121,7 +121,50 @@ export type AppSettings = {
   auto_fulfill_enabled: boolean;
   fulfillment_headless: boolean;
   fulfillment_dry_run: boolean;
+  ebay_fvf_percent: number;
+  ebay_per_order_fee: number;
+  ebay_ad_rate_percent: number;
+  amazon_shipping_cost: number;
 };
+
+/**
+ * Compute net profit per unit on an Amazon→eBay flip.
+ *
+ *   net = sale - (sale × fvf%) - per_order_fee - (sale × ad_rate%)
+ *         - amazon_price - amazon_shipping
+ *
+ * (Buyer-paid eBay shipping is assumed to net out with the seller's actual
+ * shipping cost. If you ship for less than you charge, this underestimates
+ * net by the difference.)
+ */
+export function computeNet(
+  amazonPrice: number | null | undefined,
+  salePrice: number | null | undefined,
+  s: AppSettings | null,
+): { net: number | null; netMargin: number | null; breakdown: Record<string, number> } {
+  if (!s || amazonPrice == null || salePrice == null || isNaN(amazonPrice) || isNaN(salePrice)) {
+    return { net: null, netMargin: null, breakdown: {} };
+  }
+  const fvf = salePrice * (s.ebay_fvf_percent / 100);
+  const ad = salePrice * (s.ebay_ad_rate_percent / 100);
+  const perOrder = s.ebay_per_order_fee;
+  const amazonShip = s.amazon_shipping_cost;
+  const cost = amazonPrice + amazonShip;
+  const net = +(salePrice - fvf - ad - perOrder - cost).toFixed(2);
+  const netMargin = salePrice > 0 ? +((net / salePrice) * 100).toFixed(1) : null;
+  return {
+    net,
+    netMargin,
+    breakdown: {
+      sale: +salePrice.toFixed(2),
+      fvf: +fvf.toFixed(2),
+      ad: +ad.toFixed(2),
+      per_order_fee: +perOrder.toFixed(2),
+      amazon_price: +amazonPrice.toFixed(2),
+      amazon_shipping: +amazonShip.toFixed(2),
+    },
+  };
+}
 
 export type FulfillmentAttempt = {
   id: number;

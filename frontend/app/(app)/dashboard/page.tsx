@@ -10,36 +10,58 @@ import {
   ResponsiveContainer,
   CartesianGrid,
 } from "recharts";
-import { DollarSign, Package, ShoppingCart, Activity, AlertCircle, Bell, TrendingUp, TrendingDown } from "lucide-react";
+import { DollarSign, Package, ShoppingCart, Activity, AlertCircle, Bell, TrendingUp, TrendingDown, Wallet } from "lucide-react";
 import StatsCard from "@/components/StatsCard";
 import ProductsTable from "@/components/ProductsTable";
-import { api, Alert, Product, Stats } from "@/lib/api";
+import { api, Alert, AppSettings, Product, Stats, computeNet } from "@/lib/api";
 import { money } from "@/lib/format";
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [recent, setRecent] = useState<Product[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [allProducts, setAllProducts] = useState<Product[]>([]);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
   async function load() {
     try {
       setErr(null);
-      const [s, p, a] = await Promise.all([
+      const [s, p, a, all, cfg] = await Promise.all([
         api<Stats>("/api/stats"),
         api<Product[]>("/api/products?limit=8"),
         api<Alert[]>("/api/alerts?days=30&limit=8"),
+        api<Product[]>("/api/products?limit=500"),
+        api<AppSettings>("/api/settings"),
       ]);
       setStats(s);
       setRecent(p);
       setAlerts(a);
+      setAllProducts(all);
+      setSettings(cfg);
     } catch (e: any) {
       setErr(e.message || String(e));
     } finally {
       setLoading(false);
     }
   }
+
+  // Sum of projected net profit across the whole library at current markup
+  const projectedProfit = (() => {
+    if (!settings) return null;
+    let total = 0;
+    let count = 0;
+    for (const p of allProducts) {
+      const sale = (p.price ?? 0) * (1 + settings.markup_percent / 100);
+      const r = computeNet(p.price ?? null, sale, settings);
+      if (r.net !== null) {
+        total += r.net;
+        count += 1;
+      }
+    }
+    return { total: +total.toFixed(2), count };
+  })();
 
   useEffect(() => {
     load();
@@ -83,6 +105,30 @@ export default function DashboardPage() {
           icon={ShoppingCart}
         />
       </div>
+
+      {projectedProfit && projectedProfit.count > 0 && (
+        <div className="card">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <Wallet size={20} className="text-accent" />
+              <div>
+                <h2 className="text-lg font-semibold">Projected net profit</h2>
+                <p className="text-xs text-muted">
+                  If every product sells at +{settings?.markup_percent ?? 30}% markup,
+                  after eBay fees ({settings?.ebay_fvf_percent ?? 13.25}% FVF + ${(settings?.ebay_per_order_fee ?? 0.30).toFixed(2)} per order
+                  {(settings?.ebay_ad_rate_percent ?? 0) > 0 && ` + ${settings?.ebay_ad_rate_percent}% promoted`}).
+                </p>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className={`text-2xl font-bold ${projectedProfit.total >= 0 ? "text-accent" : "text-red-400"}`}>
+                {money(projectedProfit.total)}
+              </div>
+              <div className="text-xs text-muted">across {projectedProfit.count} products</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="card lg:col-span-2">

@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle, RefreshCw } from "lucide-react";
-import { api, API_URL, AppSettings } from "@/lib/api";
+import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle, RefreshCw, Calculator } from "lucide-react";
+import { api, API_URL, AppSettings, computeNet } from "@/lib/api";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 
@@ -124,6 +124,140 @@ function EbaySection() {
         <p>3. Update the <b>Auth accepted URL</b> in your eBay app to <code>{API_URL}/auth/ebay/callback</code>.</p>
         <p>4. Click <b>Connect eBay</b> above.</p>
       </div>
+    </div>
+  );
+}
+
+function FeeStructureSection() {
+  const [s, setS] = useState<AppSettings | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    api<AppSettings>("/api/settings").then(setS).catch(() => {});
+  }, []);
+
+  async function patch(update: Partial<AppSettings>) {
+    setBusy(true);
+    try {
+      const fresh = await api<AppSettings>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify(update),
+      });
+      setS(fresh);
+      setSavedAt(Date.now());
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Worked example so the user can sanity-check the math
+  const example = computeNet(20, 20 * (1 + (s?.markup_percent ?? 30) / 100), s);
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-3">
+        <Calculator size={20} className="text-muted" />
+        <h2 className="text-lg font-semibold">Fee structure</h2>
+        {busy && <Loader2 size={14} className="animate-spin text-muted" />}
+        {!busy && savedAt && Date.now() - savedAt < 3000 && (
+          <span className="text-xs text-accent">Saved</span>
+        )}
+      </div>
+      <p className="mt-1 text-xs text-muted">
+        Used to compute net profit on the Products and Dashboard pages.
+        Defaults are typical for US managed-payments sellers — adjust to match your account.
+      </p>
+
+      {!s ? (
+        <div className="mt-3 text-sm text-muted">Loading…</div>
+      ) : (
+        <>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <FeeField
+              label="eBay Final Value Fee"
+              suffix="%"
+              value={s.ebay_fvf_percent}
+              onCommit={(v) => patch({ ebay_fvf_percent: v })}
+              hint="Applied to (item price × FVF%). 13.25% is the default for most US categories."
+            />
+            <FeeField
+              label="Per-order fee"
+              prefix="$"
+              value={s.ebay_per_order_fee}
+              onCommit={(v) => patch({ ebay_per_order_fee: v })}
+              hint="Flat fee charged on each completed sale."
+            />
+            <FeeField
+              label="Promoted Listings ad rate"
+              suffix="%"
+              value={s.ebay_ad_rate_percent}
+              onCommit={(v) => patch({ ebay_ad_rate_percent: v })}
+              hint="Set to 0 if you don't run promoted listings."
+            />
+            <FeeField
+              label="Amazon shipping cost"
+              prefix="$"
+              value={s.amazon_shipping_cost}
+              onCommit={(v) => patch({ amazon_shipping_cost: v })}
+              hint="If buying from Amazon adds shipping (no Prime), set it here."
+            />
+          </div>
+
+          <div className="mt-4 rounded-lg border border-border bg-panel2 p-3 text-xs">
+            <div className="font-semibold text-white/80">Worked example</div>
+            <div className="mt-1 text-muted">
+              Buy at $20.00 on Amazon, list at +{s.markup_percent}% (${(20 * (1 + s.markup_percent / 100)).toFixed(2)}) on eBay:
+            </div>
+            <ul className="mt-2 space-y-0.5 font-mono">
+              <li>+ Sale price: ${example.breakdown.sale?.toFixed(2)}</li>
+              <li>− eBay FVF ({s.ebay_fvf_percent}%): ${example.breakdown.fvf?.toFixed(2)}</li>
+              <li>− Promoted Listings ({s.ebay_ad_rate_percent}%): ${example.breakdown.ad?.toFixed(2)}</li>
+              <li>− Per-order fee: ${example.breakdown.per_order_fee?.toFixed(2)}</li>
+              <li>− Amazon cost: ${example.breakdown.amazon_price?.toFixed(2)}</li>
+              <li>− Amazon shipping: ${example.breakdown.amazon_shipping?.toFixed(2)}</li>
+              <li className={`pt-1 font-bold ${(example.net ?? 0) >= 0 ? "text-accent" : "text-red-400"}`}>
+                = Net: ${example.net?.toFixed(2)} ({example.netMargin}% margin)
+              </li>
+            </ul>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function FeeField({
+  label, value, onCommit, prefix, suffix, hint,
+}: {
+  label: string;
+  value: number;
+  onCommit: (v: number) => void;
+  prefix?: string;
+  suffix?: string;
+  hint?: string;
+}) {
+  const [v, setV] = useState(String(value));
+  useEffect(() => setV(String(value)), [value]);
+  return (
+    <div>
+      <label className="text-xs uppercase text-muted">{label}</label>
+      <div className="mt-1 flex items-center gap-1">
+        {prefix && <span className="text-muted">{prefix}</span>}
+        <input
+          type="number"
+          step="0.01"
+          value={v}
+          onChange={(e) => setV(e.target.value)}
+          onBlur={() => {
+            const n = Number(v);
+            if (!isNaN(n) && n !== value) onCommit(n);
+          }}
+          className="input w-full text-sm"
+        />
+        {suffix && <span className="text-muted">{suffix}</span>}
+      </div>
+      {hint && <p className="mt-1 text-xs text-muted">{hint}</p>}
     </div>
   );
 }
@@ -436,6 +570,8 @@ export default function SettingsPage() {
       <Suspense fallback={<div className="card text-muted">Loading eBay status…</div>}>
         <EbaySection />
       </Suspense>
+
+      <FeeStructureSection />
 
       <AutoRepriceSection />
 

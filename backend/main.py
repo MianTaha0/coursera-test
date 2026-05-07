@@ -380,6 +380,11 @@ DEFAULT_SETTINGS = {
     "auto_fulfill_enabled": "false",
     "fulfillment_headless": "false",
     "fulfillment_dry_run": "true",
+    # eBay fee schedule (US managed-payments defaults — buyer can override)
+    "ebay_fvf_percent": "13.25",       # Final Value Fee % on (item + shipping)
+    "ebay_per_order_fee": "0.30",      # Fixed per-order fee
+    "ebay_ad_rate_percent": "0",       # Promoted Listings ad rate %
+    "amazon_shipping_cost": "0",       # Default extra cost added to Amazon price
 }
 
 
@@ -1197,6 +1202,10 @@ def api_get_settings():
         "auto_fulfill_enabled": s.get("auto_fulfill_enabled", "false").lower() == "true",
         "fulfillment_headless": s.get("fulfillment_headless", "false").lower() == "true",
         "fulfillment_dry_run": s.get("fulfillment_dry_run", "true").lower() == "true",
+        "ebay_fvf_percent": float(s.get("ebay_fvf_percent", "13.25")),
+        "ebay_per_order_fee": float(s.get("ebay_per_order_fee", "0.30")),
+        "ebay_ad_rate_percent": float(s.get("ebay_ad_rate_percent", "0")),
+        "amazon_shipping_cost": float(s.get("amazon_shipping_cost", "0")),
     }
 
 
@@ -1209,6 +1218,10 @@ class SettingsIn(BaseModel):
     auto_fulfill_enabled: Optional[bool] = None
     fulfillment_headless: Optional[bool] = None
     fulfillment_dry_run: Optional[bool] = None
+    ebay_fvf_percent: Optional[float] = None
+    ebay_per_order_fee: Optional[float] = None
+    ebay_ad_rate_percent: Optional[float] = None
+    amazon_shipping_cost: Optional[float] = None
 
 
 @app.put("/api/settings")
@@ -1235,6 +1248,14 @@ def api_update_settings(payload: SettingsIn):
         set_setting("fulfillment_headless", "true" if payload.fulfillment_headless else "false")
     if payload.fulfillment_dry_run is not None:
         set_setting("fulfillment_dry_run", "true" if payload.fulfillment_dry_run else "false")
+    if payload.ebay_fvf_percent is not None:
+        set_setting("ebay_fvf_percent", str(payload.ebay_fvf_percent))
+    if payload.ebay_per_order_fee is not None:
+        set_setting("ebay_per_order_fee", str(payload.ebay_per_order_fee))
+    if payload.ebay_ad_rate_percent is not None:
+        set_setting("ebay_ad_rate_percent", str(payload.ebay_ad_rate_percent))
+    if payload.amazon_shipping_cost is not None:
+        set_setting("amazon_shipping_cost", str(payload.amazon_shipping_cost))
     return api_get_settings()
 
 

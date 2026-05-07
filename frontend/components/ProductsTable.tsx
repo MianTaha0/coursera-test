@@ -1,8 +1,8 @@
 "use client";
 
 import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon } from "lucide-react";
-import { useEffect, useState } from "react";
-import { api, EbayListing, Product } from "@/lib/api";
+import { useEffect, useMemo, useState } from "react";
+import { api, AppSettings, EbayListing, Product, computeNet } from "@/lib/api";
 import { money, date } from "@/lib/format";
 import PriceHistoryModal from "./PriceHistoryModal";
 
@@ -54,11 +54,15 @@ export default function ProductsTable({
     }
   }
 
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const markupPercent = settings?.markup_percent ?? DEFAULT_MARKUP_PERCENT;
+
   useEffect(() => {
     api<{ connected: boolean }>("/auth/ebay/status")
       .then((s) => setEbayConnected(s.connected))
       .catch(() => {});
     loadListings();
+    api<AppSettings>("/api/settings").then(setSettings).catch(() => {});
   }, []);
 
   function flash(msg: string, type: "ok" | "err" = "ok") {
@@ -125,7 +129,8 @@ export default function ProductsTable({
               <th className="th">Product</th>
               <th className="th">Brand</th>
               <th className="th">Amazon</th>
-              {!compact && <th className="th">List @ +{DEFAULT_MARKUP_PERCENT}%</th>}
+              {!compact && <th className="th">List @ +{markupPercent}%</th>}
+              {!compact && <th className="th">Net</th>}
               <th className="th">Stock</th>
               {!compact && <th className="th">Saved</th>}
               <th className="th text-right">Actions</th>
@@ -133,9 +138,12 @@ export default function ProductsTable({
           </thead>
           <tbody>
             {products.map((p) => {
-              const lp = ebayPrice(p.price);
+              const lp = ebayPrice(p.price, markupPercent);
               const listing = listings[p.asin];
               const isBusy = busy === p.asin;
+              // Use the actual listed price if available; otherwise the suggested price
+              const salePrice = listing?.last_price ?? lp;
+              const profit = computeNet(p.price, salePrice, settings);
               return (
                 <tr key={p.asin} className="border-t border-border">
                   <td className="td">
@@ -160,6 +168,31 @@ export default function ProductsTable({
                   <td className="td">{p.brand || "—"}</td>
                   <td className="td font-medium">{money(p.price, p.currency)}</td>
                   {!compact && <td className="td text-accent">{money(lp, p.currency)}</td>}
+                  {!compact && (
+                    <td
+                      className={`td font-medium ${
+                        profit.net === null
+                          ? "text-muted"
+                          : profit.net >= 0
+                          ? "text-accent"
+                          : "text-red-400"
+                      }`}
+                      title={
+                        profit.net === null
+                          ? "Set Amazon price to compute net profit"
+                          : `Sale ${money(profit.breakdown.sale, p.currency)} − FVF ${money(profit.breakdown.fvf, p.currency)} − Promoted ${money(profit.breakdown.ad, p.currency)} − Per-order ${money(profit.breakdown.per_order_fee, p.currency)} − Cost ${money(profit.breakdown.amazon_price, p.currency)} − Ship ${money(profit.breakdown.amazon_shipping, p.currency)}`
+                      }
+                    >
+                      {profit.net === null ? "—" : (
+                        <>
+                          {money(profit.net, p.currency)}
+                          {profit.netMargin !== null && (
+                            <span className="ml-1 text-xs text-muted">({profit.netMargin}%)</span>
+                          )}
+                        </>
+                      )}
+                    </td>
+                  )}
                   <td className="td">
                     <span
                       className={`badge ${
