@@ -58,6 +58,7 @@ EBAY_SCOPES = " ".join([
     "https://api.ebay.com/oauth/api_scope",
     "https://api.ebay.com/oauth/api_scope/sell.inventory",
     "https://api.ebay.com/oauth/api_scope/sell.account",
+    "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
 ])
 
 # ---------------------------------------------------------------------------
@@ -149,6 +150,13 @@ def db():
 
 def init_db() -> None:
     with db() as conn:
+        # Migrate the old orders schema (auto-incrementing id) → new ebay_order_id PK
+        cur = conn.execute("PRAGMA table_info(orders)").fetchall()
+        if cur and not any(c["name"] == "ebay_order_id" for c in cur):
+            existing = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+            if existing == 0:
+                conn.execute("DROP TABLE orders")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 asin TEXT PRIMARY KEY,
@@ -166,15 +174,31 @@ def init_db() -> None:
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ebay_order_id TEXT PRIMARY KEY,
                 product_asin TEXT,
+                sku TEXT,
+                line_item_id TEXT,
+                ebay_item_id TEXT,
+                quantity INTEGER DEFAULT 1,
                 buyer_name TEXT,
+                buyer_username TEXT,
+                ship_to_name TEXT,
+                ship_to_line1 TEXT,
+                ship_to_line2 TEXT,
+                ship_to_city TEXT,
+                ship_to_state TEXT,
+                ship_to_postal TEXT,
+                ship_to_country TEXT,
                 sale_price REAL,
                 amazon_cost REAL,
                 profit REAL,
+                currency TEXT,
                 status TEXT DEFAULT 'pending',
                 tracking_number TEXT,
-                created_at TEXT
+                tracking_carrier TEXT,
+                tracking_submitted_at TEXT,
+                created_at TEXT,
+                synced_at TEXT
             )
         """)
         # Active eBay listings (one row per ASIN/marketplace pair)
@@ -1270,11 +1294,193 @@ def api_listings():
     return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Routes — orders (eBay sync + tracking submit)
+# ---------------------------------------------------------------------------
 @app.get("/api/orders")
 def list_orders():
     with db() as conn:
         rows = conn.execute("SELECT * FROM orders ORDER BY created_at DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def _addr_field(addr: dict, *keys, default="") -> str:
+    cur = addr
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k, default)
+    return cur or default
+
+
+def _persist_order(order: dict[str, Any]) -> None:
+    """Map an eBay Fulfillment API order JSON into our orders table."""
+    line_items = order.get("lineItems", []) or []
+    if not line_items:
+        return
+    li = line_items[0]
+    sku = li.get("sku") or ""
+    asin = sku[len("DROPLY-"):] if sku.startswith("DROPLY-") else None
+
+    buyer = order.get("buyer", {}) or {}
+    fs = (order.get("fulfillmentStartInstructions") or [{}])[0]
+    ship = (fs.get("shippingStep") or {}).get("shipTo") or {}
+    addr = ship.get("contactAddress", {}) or {}
+    total = (order.get("pricingSummary") or {}).get("total", {}) or {}
+
+    sale_price = float(total.get("value") or 0)
+    amazon_cost = 0.0
+    if asin:
+        with db() as conn:
+            row = conn.execute("SELECT price FROM products WHERE asin = ?", (asin,)).fetchone()
+        amazon_cost = float((row["price"] if row and row["price"] is not None else 0) or 0)
+    profit = round(sale_price - amazon_cost, 2)
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO orders (
+                ebay_order_id, product_asin, sku, line_item_id, ebay_item_id, quantity,
+                buyer_name, buyer_username,
+                ship_to_name, ship_to_line1, ship_to_line2, ship_to_city,
+                ship_to_state, ship_to_postal, ship_to_country,
+                sale_price, amazon_cost, profit, currency,
+                status, tracking_number, tracking_carrier, tracking_submitted_at,
+                created_at, synced_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(ebay_order_id) DO UPDATE SET
+                product_asin=excluded.product_asin,
+                sku=excluded.sku,
+                quantity=excluded.quantity,
+                buyer_name=excluded.buyer_name,
+                buyer_username=excluded.buyer_username,
+                ship_to_name=excluded.ship_to_name,
+                ship_to_line1=excluded.ship_to_line1,
+                ship_to_line2=excluded.ship_to_line2,
+                ship_to_city=excluded.ship_to_city,
+                ship_to_state=excluded.ship_to_state,
+                ship_to_postal=excluded.ship_to_postal,
+                ship_to_country=excluded.ship_to_country,
+                sale_price=excluded.sale_price,
+                amazon_cost=excluded.amazon_cost,
+                profit=excluded.profit,
+                currency=excluded.currency,
+                status=excluded.status,
+                synced_at=excluded.synced_at
+            """,
+            (
+                order.get("orderId"),
+                asin,
+                sku,
+                li.get("lineItemId"),
+                li.get("legacyItemId"),
+                int(li.get("quantity") or 1),
+                ship.get("fullName") or buyer.get("username") or "",
+                buyer.get("username") or "",
+                ship.get("fullName") or "",
+                _addr_field(addr, "addressLine1"),
+                _addr_field(addr, "addressLine2"),
+                _addr_field(addr, "city"),
+                _addr_field(addr, "stateOrProvince"),
+                _addr_field(addr, "postalCode"),
+                _addr_field(addr, "countryCode"),
+                sale_price,
+                amazon_cost,
+                profit,
+                total.get("currency") or "USD",
+                (order.get("orderFulfillmentStatus") or "PENDING").lower(),
+                None, None, None,
+                order.get("creationDate") or now,
+                now,
+            ),
+        )
+
+
+@app.post("/api/orders/sync")
+async def sync_orders(limit: int = 50):
+    """Fetch recent orders from eBay Fulfillment API and persist them."""
+    token = await get_valid_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{EBAY_API_BASE}/sell/fulfillment/v1/order",
+            headers=headers,
+            params={"limit": min(max(int(limit), 1), 200)},
+        )
+    if r.status_code != 200:
+        raise HTTPException(502, f"eBay order fetch failed: {r.text}")
+    data = r.json()
+    orders = data.get("orders", []) or []
+    for o in orders:
+        _persist_order(o)
+    return {"ok": True, "synced": len(orders)}
+
+
+class TrackingIn(BaseModel):
+    tracking_number: str
+    carrier: str = "USPS"  # eBay carrier code, e.g. "USPS", "FEDEX", "UPS"
+
+
+@app.post("/api/orders/{order_id}/tracking")
+async def submit_tracking(order_id: str, payload: TrackingIn):
+    """Push tracking to eBay (creates a shipping_fulfillment) and store locally."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE ebay_order_id = ?", (order_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "order not found")
+    if not row["line_item_id"]:
+        raise HTTPException(400, "order has no line item id")
+
+    token = await get_valid_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    body = {
+        "lineItems": [{
+            "lineItemId": row["line_item_id"],
+            "quantity": int(row["quantity"] or 1),
+        }],
+        "shippedDate": datetime.now(timezone.utc).isoformat(),
+        "shippingCarrierCode": payload.carrier.upper(),
+        "trackingNumber": payload.tracking_number,
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{EBAY_API_BASE}/sell/fulfillment/v1/order/{order_id}/shipping_fulfillment",
+            headers=headers,
+            json=body,
+        )
+    if r.status_code not in (200, 201):
+        raise HTTPException(502, f"eBay tracking submit failed: {r.text}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """UPDATE orders SET tracking_number = ?, tracking_carrier = ?,
+                                  tracking_submitted_at = ?, status = 'shipped'
+               WHERE ebay_order_id = ?""",
+            (payload.tracking_number, payload.carrier.upper(), now, order_id),
+        )
+    return {"ok": True}
+
+
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: str):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE ebay_order_id = ?", (order_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "order not found")
+    return dict(row)
 
 
 # ---------------------------------------------------------------------------

@@ -53,15 +53,31 @@ export type Stats = {
 };
 
 export type Order = {
-  id: number;
-  product_asin: string;
+  ebay_order_id: string;
+  product_asin: string | null;
+  sku: string | null;
+  line_item_id: string | null;
+  ebay_item_id: string | null;
+  quantity: number;
   buyer_name: string | null;
+  buyer_username: string | null;
+  ship_to_name: string | null;
+  ship_to_line1: string | null;
+  ship_to_line2: string | null;
+  ship_to_city: string | null;
+  ship_to_state: string | null;
+  ship_to_postal: string | null;
+  ship_to_country: string | null;
   sale_price: number | null;
   amazon_cost: number | null;
   profit: number | null;
+  currency: string;
   status: string;
   tracking_number: string | null;
+  tracking_carrier: string | null;
+  tracking_submitted_at: string | null;
   created_at: string;
+  synced_at: string | null;
 };
 
 export type PriceSnapshot = {
