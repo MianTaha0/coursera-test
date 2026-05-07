@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, AppSettings, EbayListing, Product, VeroMatch, computeNet } from "@/lib/api";
 import { money, date } from "@/lib/format";
 import PriceHistoryModal from "./PriceHistoryModal";
+import TitleOptimizerModal from "./TitleOptimizerModal";
 
 const DEFAULT_MARKUP_PERCENT = 30;
 
@@ -40,6 +41,8 @@ export default function ProductsTable({
   const [toast, setToast] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
   const [ebayConnected, setEbayConnected] = useState(false);
   const [historyProduct, setHistoryProduct] = useState<Product | null>(null);
+  const [titleProduct, setTitleProduct] = useState<Product | null>(null);
+  const [titleOverrideVero, setTitleOverrideVero] = useState(false);
   // ASIN → listing record (persisted server-side)
   const [listings, setListings] = useState<Record<string, EbayListing>>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -95,27 +98,37 @@ export default function ProductsTable({
     }
   }
 
-  async function listOnEbayApi(p: Product, overrideVero = false) {
-    // Pre-flight VeRO check
+  function openPublishFlow(p: Product) {
+    // Pre-flight VeRO check before opening the title optimizer
     const vero = veroMap[p.asin] || [];
     const blocking = vero.filter((m) => m.level === "block");
-    if (blocking.length && !overrideVero) {
+    if (blocking.length) {
       const kws = blocking.map((m) => m.keyword).join(", ");
       const reasons = blocking.map((m) => `• ${m.keyword}: ${m.reason || ""}`).join("\n");
       const proceed = confirm(
         `⚠️ VeRO watchlist match: ${kws}\n\n${reasons}\n\nListing branded items can get your eBay account suspended. Override and publish anyway?`,
       );
       if (!proceed) return;
-      overrideVero = true;
+      setTitleOverrideVero(true);
+    } else {
+      setTitleOverrideVero(false);
     }
+    setTitleProduct(p);
+  }
+
+  async function listOnEbayApi(p: Product, customTitle: string, overrideVero: boolean) {
     setBusy(p.asin);
     try {
       const result = await api<{ ok: boolean; listing_url: string; listing_price: number }>(
         `/api/products/${encodeURIComponent(p.asin)}/list-ebay`,
-        { method: "POST", body: JSON.stringify({ override_vero: overrideVero }) }
+        {
+          method: "POST",
+          body: JSON.stringify({ title: customTitle, override_vero: overrideVero }),
+        }
       );
       flash(`Listed on eBay at ${money(result.listing_price, p.currency)} — opening listing…`, "ok");
       await loadListings();
+      setTitleProduct(null);
       window.open(result.listing_url, "_blank", "noopener");
     } catch (e: any) {
       flash(e.message || "eBay listing failed.", "err");
@@ -386,7 +399,7 @@ export default function ProductsTable({
                       ) : (
                         <button
                           onClick={() =>
-                            ebayConnected ? listOnEbayApi(p) : listOnEbayManual(p)
+                            ebayConnected ? openPublishFlow(p) : listOnEbayManual(p)
                           }
                           disabled={isBusy}
                           className="btn-primary text-xs"
@@ -455,6 +468,17 @@ export default function ProductsTable({
         <PriceHistoryModal
           product={historyProduct}
           onClose={() => setHistoryProduct(null)}
+        />
+      )}
+
+      {titleProduct && (
+        <TitleOptimizerModal
+          product={titleProduct}
+          busy={busy === titleProduct.asin}
+          onClose={() => setTitleProduct(null)}
+          onPublish={(customTitle) =>
+            listOnEbayApi(titleProduct, customTitle, titleOverrideVero)
+          }
         />
       )}
     </>

@@ -736,6 +736,7 @@ class ProductIn(BaseModel):
 class ListEbayIn(BaseModel):
     price: Optional[float] = None          # override listing price (defaults to Amazon price + 30%)
     quantity: int = 1
+    title: Optional[str] = None            # override the eBay listing title (≤80 chars)
     category_id: str = "139971"            # default: "Everything Else" (works in sandbox)
     marketplace_id: str = "EBAY_US"
     fulfillment_policy_id: Optional[str] = None
@@ -881,6 +882,7 @@ class ListEbayBulkIn(BaseModel):
     asins: list[str]
     price: Optional[float] = None
     quantity: int = 1
+    titles: Optional[dict[str, str]] = None  # asin -> custom title
     category_id: str = "139971"
     marketplace_id: str = "EBAY_US"
     override_vero: bool = False
@@ -897,6 +899,7 @@ async def list_on_ebay_bulk(body: ListEbayBulkIn):
             r = await list_on_ebay(asin, ListEbayIn(
                 price=body.price,
                 quantity=body.quantity,
+                title=(body.titles or {}).get(asin),
                 category_id=body.category_id,
                 marketplace_id=body.marketplace_id,
                 override_vero=body.override_vero,
@@ -954,7 +957,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
 
     sku = f"DROPLY-{asin}"
     merchant_location_key = "DROPLY_DEFAULT"
-    title = (product.get("title") or asin)[:80]
+    title = (body.title or product.get("title") or asin)[:80]
     description = product.get("description") or title
     images = product.get("images") or []
 
