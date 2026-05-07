@@ -223,6 +223,160 @@ function AutoRepriceSection() {
   );
 }
 
+function AmazonFulfillmentSection() {
+  const [s, setS] = useState<AppSettings | null>(null);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    api<AppSettings>("/api/settings").then((s) => {
+      setS(s);
+      setEmail(s.amazon_email || "");
+    }).catch(() => {});
+  }, []);
+
+  async function patch(update: Record<string, unknown>) {
+    setBusy(true);
+    try {
+      const fresh = await api<AppSettings>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify(update),
+      });
+      setS(fresh);
+      if (fresh.amazon_email !== undefined) setEmail(fresh.amazon_email);
+      if ("amazon_password" in update) setPassword("");
+      setSavedAt(Date.now());
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-3">
+        <Store size={20} className="text-muted" />
+        <h2 className="text-lg font-semibold">Auto-fulfillment (Amazon)</h2>
+        {busy && <Loader2 size={14} className="animate-spin text-muted" />}
+        {!busy && savedAt && Date.now() - savedAt < 3000 && (
+          <span className="text-xs text-accent">Saved</span>
+        )}
+      </div>
+
+      <div className="mt-3 flex items-start gap-2 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+        <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+        <div>
+          Credentials are stored in plaintext in <code>droply.db</code>. Don't commit
+          the database. Amazon may flag automated checkouts — keep dry-run on
+          until you've watched the flow succeed a few times.
+        </div>
+      </div>
+
+      {!s ? (
+        <div className="mt-4 text-sm text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="text-xs uppercase text-muted">Amazon email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                onBlur={() => {
+                  if (email !== s.amazon_email) patch({ amazon_email: email });
+                }}
+                placeholder="you@example.com"
+                className="input mt-1 w-full"
+              />
+            </div>
+            <div>
+              <label className="text-xs uppercase text-muted">
+                Amazon password {s.amazon_password_set && <span className="text-accent">(set)</span>}
+              </label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={s.amazon_password_set ? "•••••••• (leave blank to keep)" : "Set password"}
+                className="input mt-1 w-full"
+              />
+              <div className="mt-1 flex gap-2">
+                <button
+                  className="btn-secondary text-xs"
+                  onClick={() => password && patch({ amazon_password: password })}
+                  disabled={!password || busy}
+                >
+                  Save password
+                </button>
+                {s.amazon_password_set && (
+                  <button
+                    className="btn-danger text-xs"
+                    onClick={() => patch({ amazon_password: "__CLEAR__" })}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-2 border-t border-border pt-3">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={s.fulfillment_dry_run}
+                onChange={(e) => patch({ fulfillment_dry_run: e.target.checked })}
+                className="mt-1 h-4 w-4 accent-accent"
+              />
+              <div>
+                <div className="font-medium">Dry-run mode</div>
+                <p className="text-xs text-muted">
+                  Drives the Amazon checkout up to the review page and captures a
+                  screenshot, but never clicks <b>Place your order</b>. Recommended.
+                </p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={s.fulfillment_headless}
+                onChange={(e) => patch({ fulfillment_headless: e.target.checked })}
+                className="mt-1 h-4 w-4 accent-accent"
+              />
+              <div>
+                <div className="font-medium">Headless</div>
+                <p className="text-xs text-muted">
+                  Run Chromium without a visible window. Disable for the first few
+                  runs so you can intervene on CAPTCHA / 2FA.
+                </p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer opacity-60">
+              <input
+                type="checkbox"
+                checked={s.auto_fulfill_enabled}
+                onChange={(e) => patch({ auto_fulfill_enabled: e.target.checked })}
+                className="mt-1 h-4 w-4 accent-accent"
+              />
+              <div>
+                <div className="font-medium">Auto-fulfill on order sync</div>
+                <p className="text-xs text-muted">
+                  Run the Amazon checkout automatically each time a new eBay order
+                  is synced. Leave off until you've validated the flow manually.
+                </p>
+              </div>
+            </label>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const [apiOk, setApiOk] = useState<boolean | null>(null);
   const [stats, setStats] = useState<{ total: number; saved_today: number } | null>(null);
@@ -284,6 +438,8 @@ export default function SettingsPage() {
       </Suspense>
 
       <AutoRepriceSection />
+
+      <AmazonFulfillmentSection />
 
       {/* Chrome extension */}
       <div className="card">

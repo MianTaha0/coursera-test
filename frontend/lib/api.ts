@@ -116,6 +116,25 @@ export type AppSettings = {
   auto_reprice_enabled: boolean;
   markup_percent: number;
   min_reprice_change_percent: number;
+  amazon_email: string;
+  amazon_password_set: boolean;
+  auto_fulfill_enabled: boolean;
+  fulfillment_headless: boolean;
+  fulfillment_dry_run: boolean;
+};
+
+export type FulfillmentAttempt = {
+  id: number;
+  ebay_order_id: string;
+  product_asin: string | null;
+  status: string;
+  amazon_order_id: string | null;
+  tracking_number: string | null;
+  carrier: string | null;
+  error: string | null;
+  screenshot_path: string | null;
+  started_at: string;
+  finished_at: string | null;
 };
 
 export type EbayListing = {

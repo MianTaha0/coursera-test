@@ -30,3 +30,11 @@ Thumbs.db
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Playwright runtime state (browser cookies + Amazon login session)
+backend/.pw_user_data/
+backend/fulfillment_screenshots/
+
+# Misc local artifacts
+ngrok.zip
+.claude/

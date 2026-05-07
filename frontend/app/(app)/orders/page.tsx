@@ -10,6 +10,7 @@ import {
   Copy,
   CheckCircle2,
   AlertCircle,
+  Bot,
 } from "lucide-react";
 import { api, Order } from "@/lib/api";
 import { money, date } from "@/lib/format";
@@ -28,6 +29,7 @@ export default function OrdersPage() {
     carrier: string;
   }>({ tracking_number: "", carrier: "USPS" });
   const [submitting, setSubmitting] = useState(false);
+  const [fulfilling, setFulfilling] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -76,6 +78,36 @@ export default function OrdersPage() {
       flash("Address copied");
     } catch {
       flash("Could not copy");
+    }
+  }
+
+  async function fulfillOnAmazon(o: Order, dryRun: boolean) {
+    setFulfilling(o.ebay_order_id);
+    try {
+      const res = await api<{
+        ok: boolean;
+        status: string;
+        amazon_order_id: string | null;
+        error: string | null;
+        screenshot_path: string | null;
+      }>(`/api/orders/${encodeURIComponent(o.ebay_order_id)}/fulfill`, {
+        method: "POST",
+        body: JSON.stringify({ dry_run: dryRun }),
+      });
+      if (res.ok) {
+        flash(
+          res.status === "dry_run"
+            ? `Dry-run reached review page${res.screenshot_path ? " — screenshot saved" : ""}`
+            : `Placed Amazon order ${res.amazon_order_id || ""}`.trim(),
+        );
+      } else {
+        flash(`Fulfill failed: ${res.error || "unknown error"}`);
+      }
+      await load();
+    } catch (e: any) {
+      flash(`Failed: ${e.message}`);
+    } finally {
+      setFulfilling(null);
     }
   }
 
@@ -222,6 +254,29 @@ export default function OrdersPage() {
                               <ExternalLink size={12} /> Open on Amazon
                             </a>
                           )}
+                          <button
+                            onClick={() => fulfillOnAmazon(o, true)}
+                            disabled={fulfilling === o.ebay_order_id}
+                            className="btn-secondary text-xs"
+                            title="Drives Amazon checkout up to the review page; never places the order."
+                          >
+                            {fulfilling === o.ebay_order_id ? (
+                              <Loader2 size={12} className="animate-spin" />
+                            ) : (
+                              <Bot size={12} />
+                            )}
+                            Fulfill (dry-run)
+                          </button>
+                          <button
+                            onClick={() => {
+                              if (!confirm("Place a REAL Amazon order for this item? This will charge your card.")) return;
+                              fulfillOnAmazon(o, false);
+                            }}
+                            disabled={fulfilling === o.ebay_order_id}
+                            className="btn-primary text-xs"
+                          >
+                            <Bot size={12} /> Fulfill (live)
+                          </button>
                         </div>
                       </div>
 

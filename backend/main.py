@@ -227,6 +227,25 @@ def init_db() -> None:
             )
         """)
 
+        # Fulfillment attempts (one row per Amazon checkout run for an eBay order)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fulfillment_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ebay_order_id TEXT NOT NULL,
+                product_asin TEXT,
+                status TEXT NOT NULL,
+                amazon_order_id TEXT,
+                tracking_number TEXT,
+                carrier TEXT,
+                error TEXT,
+                screenshot_path TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                tracking_pushed_at TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_order ON fulfillment_attempts(ebay_order_id, started_at DESC)")
+
         # Buyer-message templates
         conn.execute("""
             CREATE TABLE IF NOT EXISTS message_templates (
@@ -356,6 +375,11 @@ DEFAULT_SETTINGS = {
     "auto_reprice_enabled": "false",
     "markup_percent": "30",
     "min_reprice_change_percent": "1.0",
+    "amazon_email": "",
+    "amazon_password": "",
+    "auto_fulfill_enabled": "false",
+    "fulfillment_headless": "false",
+    "fulfillment_dry_run": "true",
 }
 
 
@@ -1167,6 +1191,12 @@ def api_get_settings():
         "auto_reprice_enabled": s["auto_reprice_enabled"].lower() == "true",
         "markup_percent": float(s["markup_percent"]),
         "min_reprice_change_percent": float(s["min_reprice_change_percent"]),
+        "amazon_email": s.get("amazon_email", ""),
+        # Never return the password — only indicate whether one is set
+        "amazon_password_set": bool(s.get("amazon_password", "").strip()),
+        "auto_fulfill_enabled": s.get("auto_fulfill_enabled", "false").lower() == "true",
+        "fulfillment_headless": s.get("fulfillment_headless", "false").lower() == "true",
+        "fulfillment_dry_run": s.get("fulfillment_dry_run", "true").lower() == "true",
     }
 
 
@@ -1174,6 +1204,11 @@ class SettingsIn(BaseModel):
     auto_reprice_enabled: Optional[bool] = None
     markup_percent: Optional[float] = None
     min_reprice_change_percent: Optional[float] = None
+    amazon_email: Optional[str] = None
+    amazon_password: Optional[str] = None
+    auto_fulfill_enabled: Optional[bool] = None
+    fulfillment_headless: Optional[bool] = None
+    fulfillment_dry_run: Optional[bool] = None
 
 
 @app.put("/api/settings")
@@ -1184,6 +1219,22 @@ def api_update_settings(payload: SettingsIn):
         set_setting("markup_percent", str(payload.markup_percent))
     if payload.min_reprice_change_percent is not None:
         set_setting("min_reprice_change_percent", str(payload.min_reprice_change_percent))
+    if payload.amazon_email is not None:
+        set_setting("amazon_email", payload.amazon_email.strip())
+    if payload.amazon_password is not None:
+        # Empty string = leave unchanged; "—" sentinel = clear it
+        if payload.amazon_password == "":
+            pass
+        elif payload.amazon_password == "__CLEAR__":
+            set_setting("amazon_password", "")
+        else:
+            set_setting("amazon_password", payload.amazon_password)
+    if payload.auto_fulfill_enabled is not None:
+        set_setting("auto_fulfill_enabled", "true" if payload.auto_fulfill_enabled else "false")
+    if payload.fulfillment_headless is not None:
+        set_setting("fulfillment_headless", "true" if payload.fulfillment_headless else "false")
+    if payload.fulfillment_dry_run is not None:
+        set_setting("fulfillment_dry_run", "true" if payload.fulfillment_dry_run else "false")
     return api_get_settings()
 
 
@@ -1481,6 +1532,101 @@ def get_order(order_id: str):
     if not row:
         raise HTTPException(404, "order not found")
     return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Routes — auto-fulfillment (Playwright Amazon checkout)
+# ---------------------------------------------------------------------------
+class FulfillIn(BaseModel):
+    dry_run: Optional[bool] = None
+    headless: Optional[bool] = None
+
+
+@app.post("/api/orders/{order_id}/fulfill")
+async def fulfill_order(order_id: str, body: FulfillIn = FulfillIn()):
+    from fulfillment import (
+        BuyerAddress, FulfillRequest, fulfill_on_amazon,
+        record_attempt_start, record_attempt_finish,
+    )
+
+    with db() as conn:
+        order = conn.execute(
+            "SELECT * FROM orders WHERE ebay_order_id = ?", (order_id,)
+        ).fetchone()
+    if not order:
+        raise HTTPException(404, "order not found")
+    if not order["product_asin"]:
+        raise HTTPException(400, "order has no linked product ASIN")
+
+    with db() as conn:
+        product = conn.execute(
+            "SELECT * FROM products WHERE asin = ?", (order["product_asin"],)
+        ).fetchone()
+    if not product or not product["amazon_url"]:
+        raise HTTPException(400, "product (or its amazon_url) is missing")
+
+    cfg = get_settings_dict()
+    email = cfg.get("amazon_email", "").strip()
+    password = cfg.get("amazon_password", "").strip()
+    if not email or not password:
+        raise HTTPException(400, "Amazon credentials not configured (Settings → Amazon account)")
+
+    dry_run = body.dry_run if body.dry_run is not None else cfg.get("fulfillment_dry_run", "true").lower() == "true"
+    headless = body.headless if body.headless is not None else cfg.get("fulfillment_headless", "false").lower() == "true"
+
+    req = FulfillRequest(
+        ebay_order_id=order["ebay_order_id"],
+        asin=order["product_asin"],
+        amazon_url=product["amazon_url"],
+        quantity=int(order["quantity"] or 1),
+        buyer=BuyerAddress(
+            full_name=order["ship_to_name"] or order["buyer_name"] or "",
+            street1=order["ship_to_line1"] or "",
+            street2=order["ship_to_line2"] or "",
+            city=order["ship_to_city"] or "",
+            state=order["ship_to_state"] or "",
+            postal_code=order["ship_to_postal"] or "",
+            country_code=order["ship_to_country"] or "US",
+            phone="",
+        ),
+    )
+
+    with db() as conn:
+        attempt_id = record_attempt_start(conn, req)
+
+    result = await fulfill_on_amazon(
+        req=req, amazon_email=email, amazon_password=password,
+        headless=headless, dry_run=dry_run,
+    )
+
+    with db() as conn:
+        record_attempt_finish(conn, attempt_id, result)
+        if result.amazon_order_id:
+            conn.execute(
+                "UPDATE orders SET status = 'fulfilled' WHERE ebay_order_id = ?",
+                (order_id,),
+            )
+
+    return {
+        "ok": result.status in ("success", "dry_run"),
+        "attempt_id": attempt_id,
+        "status": result.status,
+        "amazon_order_id": result.amazon_order_id,
+        "tracking_number": result.tracking_number,
+        "carrier": result.carrier,
+        "error": result.error,
+        "screenshot_path": result.screenshot_path,
+    }
+
+
+@app.get("/api/orders/{order_id}/fulfillment-attempts")
+def list_attempts(order_id: str):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM fulfillment_attempts WHERE ebay_order_id = ? ORDER BY started_at DESC",
+            (order_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
