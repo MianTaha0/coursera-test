@@ -270,10 +270,30 @@ export type OutboundMessage = {
   template_slug: string;
   subject: string;
   body: string;
-  status: "queued" | "sent";
+  status: "queued" | "sent" | "failed";
   trigger_event: string;
   created_at: string;
   sent_at: string | null;
+  error?: string | null;
+  last_attempt_at?: string | null;
+};
+
+export type InboundMessage = {
+  id: number;
+  account_id: number;
+  ebay_message_id: string;
+  ebay_order_id: string | null;
+  ebay_item_id: string | null;
+  sender_username: string | null;
+  subject: string | null;
+  body: string | null;
+  received_at: string;
+  fetched_at: string;
+  read_at: string | null;
+  replied_at: string | null;
+  auto_replied: number;
+  matched_rule_id: number | null;
+  needs_reply: number;
 };
 
 export type FulfillmentAttempt = {

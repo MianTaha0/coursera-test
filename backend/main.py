@@ -30,7 +30,7 @@ import sqlite3
 import time
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from html import escape as html_escape
 from typing import Any, Optional
 from urllib.parse import urlencode
@@ -412,6 +412,35 @@ def init_db() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbound_order ON outbound_messages(ebay_order_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_messages(status, created_at DESC)")
+
+        # Inbound buyer messages (Phase 4.1). Polled from eBay Trading
+        # GetMyMessages; each row corresponds to one MessageID. Multi-account
+        # safe via the account_id column. `needs_reply` flips to 0 when we
+        # auto-reply or the user marks the row replied.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inbound_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                ebay_message_id TEXT NOT NULL,
+                ebay_order_id TEXT,
+                ebay_item_id TEXT,
+                sender_username TEXT,
+                subject TEXT,
+                body TEXT,
+                received_at TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                read_at TEXT,
+                replied_at TEXT,
+                auto_replied INTEGER NOT NULL DEFAULT 0,
+                matched_rule_id INTEGER,
+                needs_reply INTEGER NOT NULL DEFAULT 1,
+                raw_json TEXT,
+                UNIQUE (account_id, ebay_message_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_received ON inbound_messages(received_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_needs_reply ON inbound_messages(needs_reply, received_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_order ON inbound_messages(ebay_order_id, received_at DESC)")
 
         # Buyer-message templates
         conn.execute("""
@@ -3109,6 +3138,163 @@ async def flush_outbound_messages(*, limit: int = 50) -> dict[str, Any]:
             "processed": sent + failed}
 
 
+# ---------------------------------------------------------------------------
+# Inbound message poll (Phase 4.1)
+# eBay Trading API GetMyMessages is the only channel that returns the full
+# buyer-message stream including "Ask a question" threads. Polled once per
+# connected eBay account on a 5-minute scheduler.
+# ---------------------------------------------------------------------------
+
+def _xml_text(root: ET.Element, tag: str) -> str:
+    """Find the first descendant element with local-name `tag` and return text."""
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] == tag and el.text:
+            return el.text.strip()
+    return ""
+
+
+async def _fetch_member_messages(
+    *, token: str, start: datetime, end: datetime,
+) -> tuple[bool, str, list[dict[str, Any]]]:
+    """Call Trading API GetMyMessages between `start` and `end`.
+
+    Returns (ok, detail, messages). On success `messages` is a list of dicts
+    with the fields we care about (ebay_message_id, sender_username, subject,
+    body, received_at, ebay_order_id, ebay_item_id, raw_xml).
+    """
+    fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+    xml_body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<GetMyMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+        "  <DetailLevel>ReturnMessages</DetailLevel>"
+        f"  <StartTime>{start.strftime(fmt)}</StartTime>"
+        f"  <EndTime>{end.strftime(fmt)}</EndTime>"
+        "</GetMyMessagesRequest>"
+    )
+    headers = {
+        "X-EBAY-API-COMPATIBILITY-LEVEL": EBAY_TRADING_COMPAT_LEVEL,
+        "X-EBAY-API-CALL-NAME": "GetMyMessages",
+        "X-EBAY-API-SITEID": EBAY_TRADING_SITE_ID,
+        "X-EBAY-API-IAF-TOKEN": token,
+        "Content-Type": "text/xml",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(EBAY_TRADING_URL, content=xml_body, headers=headers)
+    except httpx.HTTPError as e:
+        return (False, f"HTTP error: {e}", [])
+    if r.status_code != 200:
+        return (False, f"HTTP {r.status_code}: {r.text[:300]}", [])
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError as e:
+        return (False, f"Bad XML: {e}", [])
+
+    ack = _xml_text(root, "Ack").lower()
+    if ack not in ("success", "warning"):
+        short = _xml_text(root, "ShortMessage") or "eBay GetMyMessages failed"
+        return (False, short[:300], [])
+
+    messages = []
+    for msg in root.iter():
+        if msg.tag.rsplit("}", 1)[-1] != "Message":
+            continue
+        raw_text = ET.tostring(msg, encoding="unicode")
+        messages.append({
+            "ebay_message_id":  _xml_text(msg, "MessageID"),
+            "sender_username":  _xml_text(msg, "Sender"),
+            "subject":          _xml_text(msg, "Subject"),
+            "body":             _xml_text(msg, "Text") or _xml_text(msg, "Body"),
+            "received_at":      _xml_text(msg, "ReceiveDate"),
+            "ebay_item_id":     _xml_text(msg, "ItemID"),
+            "ebay_order_id":    "",  # GetMyMessages doesn't return order id directly
+            "raw_xml":          raw_text[:8000],
+        })
+    return (True, "ok", messages)
+
+
+async def poll_inbound_for_account(
+    *, account_id: int, lookback_days: int = 7,
+) -> dict[str, Any]:
+    """Fetch + persist inbound messages for one eBay account.
+
+    On first run for an account, looks back `lookback_days` days. On
+    subsequent runs, looks back from the saved `last_inbox_poll_at` setting
+    (with a one-hour overlap to catch eBay's eventual-consistency lag).
+    """
+    last_key = f"last_inbox_poll_at_{account_id}"
+    last_iso = (get_settings_dict().get(last_key) or "").strip()
+    now = datetime.now(timezone.utc)
+    if last_iso:
+        try:
+            start = datetime.fromisoformat(last_iso) - timedelta(hours=1)
+        except (TypeError, ValueError):
+            start = now - timedelta(days=lookback_days)
+    else:
+        start = now - timedelta(days=lookback_days)
+
+    try:
+        token = await get_valid_token(account_id=account_id)
+    except HTTPException as e:
+        return {"ok": False, "account_id": account_id, "skipped": True,
+                "error": e.detail}
+
+    ok, detail, messages = await _fetch_member_messages(token=token, start=start, end=now)
+    if not ok:
+        return {"ok": False, "account_id": account_id, "error": detail}
+
+    inserted = 0
+    now_iso = now.isoformat()
+    with db() as conn:
+        for m in messages:
+            mid = (m.get("ebay_message_id") or "").strip()
+            if not mid:
+                continue
+            try:
+                conn.execute(
+                    """INSERT INTO inbound_messages
+                          (account_id, ebay_message_id, ebay_order_id, ebay_item_id,
+                           sender_username, subject, body, received_at, fetched_at, raw_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        account_id, mid,
+                        m.get("ebay_order_id") or None,
+                        m.get("ebay_item_id") or None,
+                        m.get("sender_username") or None,
+                        m.get("subject") or None,
+                        m.get("body") or None,
+                        m.get("received_at") or now_iso,
+                        now_iso,
+                        m.get("raw_xml") or None,
+                    ),
+                )
+                inserted += 1
+            except sqlite3.IntegrityError:
+                # Already have this MessageID for this account
+                pass
+
+    set_setting(last_key, now_iso)
+    return {"ok": True, "account_id": account_id, "fetched": len(messages),
+            "inserted": inserted}
+
+
+async def poll_inbound_for_all_accounts(*, lookback_days: int = 7) -> dict[str, Any]:
+    """Run the inbound poll across every connected eBay account."""
+    with db() as conn:
+        rows = conn.execute("SELECT id FROM ebay_accounts").fetchall()
+    if not rows:
+        return {"ok": True, "accounts": 0, "details": []}
+    out = []
+    for r in rows:
+        try:
+            out.append(await poll_inbound_for_account(
+                account_id=r["id"], lookback_days=lookback_days,
+            ))
+        except Exception as e:  # noqa: BLE001 — never break the scheduler loop
+            out.append({"ok": False, "account_id": r["id"], "error": str(e)[:200]})
+    return {"ok": True, "accounts": len(rows), "details": out}
+
+
 def _slugify(s: str) -> str:
     out = "".join(c if c.isalnum() else "_" for c in s.strip().lower())
     return "_".join(filter(None, out.split("_")))[:60] or "template"
@@ -3311,6 +3497,74 @@ def preview_description_template(template_id: int, asin: Optional[str] = None):
 
 
 # ---------------------------------------------------------------------------
+# Routes — inbound buyer messages (Phase 4.1)
+# ---------------------------------------------------------------------------
+@app.get("/api/messages/inbound")
+def list_inbound_messages(
+    order_id: Optional[str] = None,
+    sender: Optional[str] = None,
+    needs_reply: Optional[bool] = None,
+    limit: int = 200,
+):
+    sql = "SELECT * FROM inbound_messages WHERE 1=1"
+    params: list[Any] = []
+    if order_id:
+        sql += " AND ebay_order_id = ?"
+        params.append(order_id)
+    if sender:
+        sql += " AND sender_username = ?"
+        params.append(sender)
+    if needs_reply is not None:
+        sql += " AND needs_reply = ?"
+        params.append(1 if needs_reply else 0)
+    sql += " ORDER BY received_at DESC LIMIT ?"
+    params.append(int(limit))
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/messages/inbound/poll-now")
+async def api_inbox_poll_now(lookback_days: int = 7):
+    """Trigger the inbound poll across all connected eBay accounts."""
+    return await poll_inbound_for_all_accounts(lookback_days=lookback_days)
+
+
+@app.post("/api/messages/inbound/{message_id}/mark-read")
+def api_inbox_mark_read(message_id: int):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM inbound_messages WHERE id = ?", (message_id,)).fetchone():
+            raise HTTPException(404, "message not found")
+        conn.execute(
+            "UPDATE inbound_messages SET read_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), message_id),
+        )
+    return {"ok": True}
+
+
+@app.post("/api/messages/inbound/{message_id}/mark-replied")
+def api_inbox_mark_replied(message_id: int):
+    """Manually flag a message as replied (clears the needs_reply badge)."""
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM inbound_messages WHERE id = ?", (message_id,)).fetchone():
+            raise HTTPException(404, "message not found")
+        conn.execute(
+            """UPDATE inbound_messages
+                  SET replied_at = ?, needs_reply = 0
+                WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(), message_id),
+        )
+    return {"ok": True}
+
+
+@app.delete("/api/messages/inbound/{message_id}")
+def api_inbox_delete(message_id: int):
+    with db() as conn:
+        cur = conn.execute("DELETE FROM inbound_messages WHERE id = ?", (message_id,))
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+# ---------------------------------------------------------------------------
 # Routes — outbound buyer messages
 # ---------------------------------------------------------------------------
 @app.get("/api/messages/outbound")
@@ -3342,7 +3596,7 @@ def api_scheduler_status():
 @app.post("/api/scheduler/run-now/{job_id}")
 async def api_scheduler_run_now(job_id: str):
     """Fire a specific scheduler job immediately (useful for sandbox testing)."""
-    valid = {"message_flush", "order_sync", "tracking_refresh"}
+    valid = {"message_flush", "order_sync", "tracking_refresh", "inbox_poll"}
     if job_id not in valid:
         raise HTTPException(400, f"unknown job '{job_id}'. expected one of {sorted(valid)}")
     if job_id == "message_flush":
@@ -3351,6 +3605,8 @@ async def api_scheduler_run_now(job_id: str):
         return await sync_orders(limit=50)
     if job_id == "tracking_refresh":
         return await refresh_all_tracking()
+    if job_id == "inbox_poll":
+        return await poll_inbound_for_all_accounts(lookback_days=7)
     raise HTTPException(500, "unreachable")
 
 

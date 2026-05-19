@@ -80,6 +80,19 @@ async def _job_message_flush() -> None:
         logger.warning("message_flush failed: %s", e)
 
 
+async def _job_inbox_poll() -> None:
+    """Phase 4.1 — pull new buyer messages from Trading GetMyMessages."""
+    if not _enabled():
+        return
+    from backend.main import poll_inbound_for_all_accounts
+    try:
+        result = await poll_inbound_for_all_accounts(lookback_days=7)
+        _record("inbox_poll", result, None)
+    except Exception as e:  # noqa: BLE001
+        _record("inbox_poll", None, str(e)[:300])
+        logger.warning("inbox_poll failed: %s", e)
+
+
 def start() -> None:
     """Idempotent: safe to call multiple times (replaces existing jobs)."""
     global _scheduler
@@ -89,6 +102,11 @@ def start() -> None:
     _scheduler.add_job(
         _job_message_flush, IntervalTrigger(minutes=1),
         id="message_flush", replace_existing=True, max_instances=1,
+        coalesce=True,
+    )
+    _scheduler.add_job(
+        _job_inbox_poll, IntervalTrigger(minutes=5),
+        id="inbox_poll", replace_existing=True, max_instances=1,
         coalesce=True,
     )
     _scheduler.add_job(
@@ -104,7 +122,7 @@ def start() -> None:
 
     if not _scheduler.running:
         _scheduler.start()
-    logger.info("Droply scheduler started (3 jobs).")
+    logger.info("Droply scheduler started (4 jobs).")
 
 
 def shutdown() -> None:
