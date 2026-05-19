@@ -16,10 +16,175 @@ import {
   PackageCheck,
   PackageSearch,
 } from "lucide-react";
-import { api, Order, OutboundMessage, carrierTrackingUrl } from "@/lib/api";
+import { api, BuyerOffer, Order, OutboundMessage, carrierTrackingUrl } from "@/lib/api";
 import { money, date } from "@/lib/format";
 
 const CARRIERS = ["USPS", "FEDEX", "UPS", "DHL"];
+
+function BestOffersCard() {
+  const [offers, setOffers] = useState<BuyerOffer[]>([]);
+  const [busy, setBusy] = useState<number | "poll" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    try {
+      const rs = await api<BuyerOffer[]>("/api/best-offers?status=pending");
+      setOffers(rs);
+      setError(null);
+    } catch (e: any) {
+      setError(e.message || "Failed to load offers");
+    }
+  }
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function pollNow() {
+    setBusy("poll");
+    try {
+      await api("/api/best-offers/poll-now", { method: "POST" });
+      await load();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function respond(
+    o: BuyerOffer,
+    action: "accept" | "decline" | "counter",
+    counterPrice?: number,
+  ) {
+    setBusy(o.id);
+    setError(null);
+    try {
+      await api(`/api/best-offers/${o.id}/respond`, {
+        method: "POST",
+        body: JSON.stringify({ action, counter_price: counterPrice }),
+      });
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Response failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function startCounter(o: BuyerOffer) {
+    const base = o.list_price ?? o.offer_price ?? 0;
+    const input = prompt(
+      `Counter-offer price (eBay will send to ${o.buyer_username}):`,
+      String(((o.offer_price ?? 0) + base) / 2),
+    );
+    if (!input) return;
+    const n = Number(input);
+    if (!isFinite(n) || n <= 0) return;
+    respond(o, "counter", n);
+  }
+
+  // Hide the card entirely when there's nothing pending — keeps the orders
+  // page clean for sellers who don't enable Best Offer on their listings.
+  if (!offers.length && !error) return null;
+
+  return (
+    <div className="card">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">Best Offers</h2>
+          <p className="text-xs text-muted">
+            Pending buyer offers on your active listings. Auto-rules in Settings
+            handle the obvious accept/decline cases.
+          </p>
+        </div>
+        <button
+          onClick={pollNow}
+          disabled={busy === "poll"}
+          className="btn-secondary text-xs"
+        >
+          {busy === "poll" ? (
+            <Loader2 size={12} className="animate-spin" />
+          ) : (
+            <RefreshCw size={12} />
+          )}
+          Poll now
+        </button>
+      </div>
+      {error && (
+        <div className="mt-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+          {error}
+        </div>
+      )}
+      <div className="mt-3 space-y-2">
+        {offers.map((o) => {
+          const pct =
+            o.list_price && o.list_price > 0
+              ? Math.round(((o.offer_price ?? 0) / o.list_price) * 100)
+              : null;
+          return (
+            <div
+              key={o.id}
+              className="rounded-lg border border-border bg-panel2 p-3"
+            >
+              <div className="flex flex-wrap items-center gap-3 text-sm">
+                <span className="font-medium">{o.buyer_username || "(unknown buyer)"}</span>
+                <span className="font-mono text-xs text-muted">
+                  Item {o.ebay_item_id}
+                </span>
+                <span className="ml-auto">
+                  <b>{money(o.offer_price, o.currency || "USD")}</b>{" "}
+                  <span className="text-muted">
+                    of {money(o.list_price, o.currency || "USD")}
+                    {pct !== null && ` · ${pct}%`}
+                  </span>
+                </span>
+              </div>
+              {o.buyer_message && (
+                <div className="mt-1 text-xs italic text-white/80">
+                  "{o.buyer_message}"
+                </div>
+              )}
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  onClick={() => respond(o, "accept")}
+                  disabled={busy === o.id}
+                  className="btn-primary text-xs"
+                >
+                  {busy === o.id ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : (
+                    <CheckCircle2 size={12} />
+                  )}
+                  Accept
+                </button>
+                <button
+                  onClick={() => respond(o, "decline")}
+                  disabled={busy === o.id}
+                  className="btn-danger text-xs"
+                >
+                  Decline
+                </button>
+                <button
+                  onClick={() => startCounter(o)}
+                  disabled={busy === o.id}
+                  className="btn-secondary text-xs"
+                >
+                  Counter…
+                </button>
+                {o.auto_action && (
+                  <span className="ml-auto self-center text-[10px] uppercase text-muted">
+                    auto: {o.auto_action}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 export default function OrdersPage() {
   const [orders, setOrders] = useState<Order[]>([]);
@@ -218,6 +383,8 @@ export default function OrdersPage() {
           </button>
         </div>
       </div>
+
+      <BestOffersCard />
 
       {flashMsg && (
         <div className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-sm text-accent">

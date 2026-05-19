@@ -196,10 +196,9 @@ export type AppSettings = {
   scheduler_enabled?: boolean;
   default_description_template_slug?: string;
   margin_rules?: MarginRule[];
-  // Phase 3.1
+  // Phase 3.1 / 3.4
   dispatch_deadline_business_days?: number;
   dispatch_deadline_urgent_hours?: number;
-  // Phase 3.4
   feedback_request_delay_days?: number;
 };
 
@@ -290,6 +289,26 @@ export type OutboundMessage = {
   sent_at: string | null;
   error?: string | null;
   last_attempt_at?: string | null;
+};
+
+export type BuyerOffer = {
+  id: number;
+  account_id: number | null;
+  ebay_offer_id: string;
+  ebay_item_id: string;
+  asin: string | null;
+  buyer_username: string | null;
+  offer_price: number | null;
+  list_price: number | null;
+  currency: string | null;
+  quantity: number | null;
+  buyer_message: string | null;
+  status: "pending" | "accepted" | "declined" | "countered" | "expired" | "auto_failed";
+  expires_at: string | null;
+  received_at: string;
+  responded_at: string | null;
+  auto_action: string | null;
+  error: string | null;
 };
 
 export type InboundRule = {

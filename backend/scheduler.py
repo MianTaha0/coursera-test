@@ -106,6 +106,19 @@ async def _job_feedback_followup() -> None:
         logger.warning("feedback_followup failed: %s", e)
 
 
+async def _job_best_offer_poll() -> None:
+    """Phase 3.2 — pull active Best Offers per listing, auto-apply rules."""
+    if not _enabled():
+        return
+    from backend.main import poll_best_offers_for_all_accounts
+    try:
+        result = await poll_best_offers_for_all_accounts()
+        _record("best_offer_poll", result, None)
+    except Exception as e:  # noqa: BLE001
+        _record("best_offer_poll", None, str(e)[:300])
+        logger.warning("best_offer_poll failed: %s", e)
+
+
 def start() -> None:
     """Idempotent: safe to call multiple times (replaces existing jobs)."""
     global _scheduler
@@ -137,10 +150,15 @@ def start() -> None:
         id="feedback_followup", replace_existing=True, max_instances=1,
         coalesce=True,
     )
+    _scheduler.add_job(
+        _job_best_offer_poll, IntervalTrigger(minutes=15),
+        id="best_offer_poll", replace_existing=True, max_instances=1,
+        coalesce=True,
+    )
 
     if not _scheduler.running:
         _scheduler.start()
-    logger.info("Droply scheduler started (5 jobs).")
+    logger.info("Droply scheduler started (6 jobs).")
 
 
 def shutdown() -> None:

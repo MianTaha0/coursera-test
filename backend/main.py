@@ -382,6 +382,36 @@ def init_db() -> None:
             )
         """)
 
+        # Phase 3.2 — Buyer offers (Best Offer). Polled from Trading API
+        # GetBestOffers per active listing. Status flows pending → accepted /
+        # declined / expired / countered. (account_id + ebay_offer_id) unique
+        # so re-polls dedupe.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS buyer_offers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER,
+                ebay_offer_id TEXT NOT NULL,
+                ebay_item_id TEXT NOT NULL,
+                asin TEXT,
+                buyer_username TEXT,
+                offer_price REAL,
+                list_price REAL,
+                currency TEXT,
+                quantity INTEGER,
+                buyer_message TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                expires_at TEXT,
+                received_at TEXT NOT NULL,
+                responded_at TEXT,
+                auto_action TEXT,
+                error TEXT,
+                raw_json TEXT,
+                UNIQUE (account_id, ebay_offer_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_status ON buyer_offers(status, received_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_item ON buyer_offers(ebay_item_id)")
+
         # Simple key/value config store
         conn.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
@@ -904,6 +934,17 @@ DEFAULT_SETTINGS = {
     # feedback_request template. eBay's own feedback request prompt fires at
     # ~5 days; sending earlier feels pushy.
     "feedback_request_delay_days": "7",
+    # Phase 3.2 — Best Offer thresholds. Auto-accept any offer at or above
+    # accept_pct of the list price. Auto-decline any offer at or below
+    # decline_pct. Anything in between is left for manual review.
+    # Defaults: only auto-accept full-price offers (rare; mostly a no-op
+    # until the seller tunes them).
+    "best_offer_auto_accept_percent": "100",
+    "best_offer_auto_decline_percent": "0",
+    # Phase 3.2 — Counter-offer percentage (sent in response to declined
+    # offers when between accept and decline thresholds). Set to 0 to skip
+    # counters and just leave the offer pending.
+    "best_offer_counter_percent": "0",
     # Description template used at publish time. Empty string = use raw
     # product description (the Amazon bullets).
     "default_description_template_slug": "default",
@@ -2702,6 +2743,10 @@ def api_get_settings():
         "dispatch_deadline_urgent_hours": float(s.get("dispatch_deadline_urgent_hours", "6")),
         # Phase 3.4 — auto-feedback delay
         "feedback_request_delay_days": float(s.get("feedback_request_delay_days", "7")),
+        # Phase 3.2 — Best Offer thresholds
+        "best_offer_auto_accept_percent": float(s.get("best_offer_auto_accept_percent", "100")),
+        "best_offer_auto_decline_percent": float(s.get("best_offer_auto_decline_percent", "0")),
+        "best_offer_counter_percent": float(s.get("best_offer_counter_percent", "0")),
         # Phase 2.3: which description template to render at publish time.
         # Empty string = skip the template and use the raw Amazon description.
         "default_description_template_slug": s.get("default_description_template_slug", "default"),
@@ -2732,6 +2777,9 @@ class SettingsIn(BaseModel):
     dispatch_deadline_business_days: Optional[float] = None
     dispatch_deadline_urgent_hours: Optional[float] = None
     feedback_request_delay_days: Optional[float] = None
+    best_offer_auto_accept_percent: Optional[float] = None
+    best_offer_auto_decline_percent: Optional[float] = None
+    best_offer_counter_percent: Optional[float] = None
     default_description_template_slug: Optional[str] = None
     margin_rules: Optional[list[dict[str, Any]]] = None
 
@@ -2796,6 +2844,12 @@ def api_update_settings(payload: SettingsIn):
         set_setting("dispatch_deadline_urgent_hours", str(payload.dispatch_deadline_urgent_hours))
     if payload.feedback_request_delay_days is not None:
         set_setting("feedback_request_delay_days", str(payload.feedback_request_delay_days))
+    if payload.best_offer_auto_accept_percent is not None:
+        set_setting("best_offer_auto_accept_percent", str(payload.best_offer_auto_accept_percent))
+    if payload.best_offer_auto_decline_percent is not None:
+        set_setting("best_offer_auto_decline_percent", str(payload.best_offer_auto_decline_percent))
+    if payload.best_offer_counter_percent is not None:
+        set_setting("best_offer_counter_percent", str(payload.best_offer_counter_percent))
     if payload.default_description_template_slug is not None:
         set_setting("default_description_template_slug", payload.default_description_template_slug)
     if payload.margin_rules is not None:
@@ -3672,6 +3726,278 @@ def queue_overdue_feedback_requests() -> dict[str, Any]:
             "delay_days": delay_days}
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.2 — Best Offer
+# Polls Trading API GetBestOffers per active listing and persists offers to
+# the local buyer_offers table. Auto-accept / auto-decline rules from
+# settings apply on first sight of each offer.
+# ---------------------------------------------------------------------------
+
+async def _fetch_active_best_offers(
+    *, token: str, item_id: str,
+) -> tuple[bool, str, list[dict[str, Any]]]:
+    """Call Trading API GetBestOffers for a specific ItemID, filtering to
+    active offers. Returns (ok, detail, offers).
+    """
+    xml_body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<GetBestOffersRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+        "  <DetailLevel>ReturnAll</DetailLevel>"
+        f"  <ItemID>{html_escape(item_id)}</ItemID>"
+        "  <BestOfferStatus>Active</BestOfferStatus>"
+        "</GetBestOffersRequest>"
+    )
+    headers = {
+        "X-EBAY-API-COMPATIBILITY-LEVEL": EBAY_TRADING_COMPAT_LEVEL,
+        "X-EBAY-API-CALL-NAME": "GetBestOffers",
+        "X-EBAY-API-SITEID": EBAY_TRADING_SITE_ID,
+        "X-EBAY-API-IAF-TOKEN": token,
+        "Content-Type": "text/xml",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(EBAY_TRADING_URL, content=xml_body, headers=headers)
+    except httpx.HTTPError as e:
+        return (False, f"HTTP error: {e}", [])
+    if r.status_code != 200:
+        return (False, f"HTTP {r.status_code}: {r.text[:300]}", [])
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError as e:
+        return (False, f"Bad XML: {e}", [])
+
+    ack = _xml_text(root, "Ack").lower()
+    if ack not in ("success", "warning"):
+        short = _xml_text(root, "ShortMessage") or "GetBestOffers failed"
+        return (False, short[:300], [])
+
+    offers = []
+    for off in root.iter():
+        if off.tag.rsplit("}", 1)[-1] != "BestOffer":
+            continue
+        # Walk the children we care about
+        sub: dict[str, str] = {}
+        for child in off.iter():
+            tag = child.tag.rsplit("}", 1)[-1]
+            txt = (child.text or "").strip() if child.text else ""
+            if tag and txt and tag not in sub:
+                sub[tag] = txt
+        try:
+            price = float(sub.get("Price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            qty = int(sub.get("Quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        offers.append({
+            "ebay_offer_id":   sub.get("BestOfferID"),
+            "buyer_username":  sub.get("UserID") or sub.get("Buyer"),
+            "offer_price":     price,
+            "currency":        sub.get("currencyID") or sub.get("PriceCurrency") or "USD",
+            "quantity":        qty,
+            "buyer_message":   sub.get("BuyerMessage") or "",
+            "status":          (sub.get("Status") or "Pending").lower(),
+            "expires_at":      sub.get("ExpirationTime") or "",
+        })
+    return (True, "ok", offers)
+
+
+async def _respond_to_best_offer(
+    *, token: str, item_id: str, offer_id: str, action: str,
+    counter_price: Optional[float] = None, seller_response: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Call Trading RespondToBestOffer (Accept | Decline | Counter)."""
+    if action not in ("Accept", "Decline", "Counter"):
+        return (False, f"unknown action: {action}")
+    counter_xml = ""
+    if action == "Counter":
+        if counter_price is None or counter_price <= 0:
+            return (False, "counter_price required for Counter action")
+        counter_xml = f"<CounterOfferPrice>{counter_price:.2f}</CounterOfferPrice>"
+
+    response_xml = ""
+    if seller_response:
+        response_xml = f"<SellerResponse>{html_escape(seller_response)}</SellerResponse>"
+
+    xml_body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<RespondToBestOfferRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+        f"  <ItemID>{html_escape(item_id)}</ItemID>"
+        f"  <BestOfferID>{html_escape(offer_id)}</BestOfferID>"
+        f"  <Action>{action}</Action>"
+        f"  {counter_xml}"
+        f"  {response_xml}"
+        "</RespondToBestOfferRequest>"
+    )
+    headers = {
+        "X-EBAY-API-COMPATIBILITY-LEVEL": EBAY_TRADING_COMPAT_LEVEL,
+        "X-EBAY-API-CALL-NAME": "RespondToBestOffer",
+        "X-EBAY-API-SITEID": EBAY_TRADING_SITE_ID,
+        "X-EBAY-API-IAF-TOKEN": token,
+        "Content-Type": "text/xml",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(EBAY_TRADING_URL, content=xml_body, headers=headers)
+    except httpx.HTTPError as e:
+        return (False, f"HTTP error: {e}")
+    if r.status_code != 200:
+        return (False, f"HTTP {r.status_code}: {r.text[:300]}")
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError as e:
+        return (False, f"Bad XML: {e}")
+    if _xml_text(root, "Ack").lower() in ("success", "warning"):
+        return (True, "ok")
+    return (False, (_xml_text(root, "ShortMessage") or "RespondToBestOffer failed")[:300])
+
+
+def _apply_best_offer_auto_rule(
+    *, offer_row_id: int, offer_price: float, list_price: float,
+) -> Optional[str]:
+    """Given persisted offer + list price, return the action to take:
+    "accept", "decline", "counter", or None (leave pending).
+    """
+    if list_price <= 0:
+        return None
+    cfg = get_settings_dict()
+    try:
+        accept_pct = float(cfg.get("best_offer_auto_accept_percent") or 100)
+        decline_pct = float(cfg.get("best_offer_auto_decline_percent") or 0)
+        counter_pct = float(cfg.get("best_offer_counter_percent") or 0)
+    except (TypeError, ValueError):
+        return None
+    ratio = (offer_price / list_price) * 100.0
+    if ratio >= accept_pct:
+        return "accept"
+    if ratio <= decline_pct:
+        return "decline"
+    if counter_pct > 0:
+        return "counter"
+    return None
+
+
+async def poll_best_offers_for_account(*, account_id: int) -> dict[str, Any]:
+    """Iterate active listings for the account, fetch + persist offers,
+    apply auto-accept / decline / counter rules on first sight.
+    """
+    try:
+        token = await get_valid_token(account_id=account_id)
+    except HTTPException as e:
+        return {"ok": False, "account_id": account_id, "skipped": True,
+                "error": e.detail}
+
+    with db() as conn:
+        listings = conn.execute(
+            "SELECT * FROM ebay_listings WHERE listing_id IS NOT NULL AND paused = 0"
+        ).fetchall()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    inserted = 0
+    auto_acted = 0
+    errors: list[str] = []
+
+    for listing in listings:
+        item_id = listing["listing_id"]
+        list_price = float(listing["last_price"] or 0)
+        ok, detail, offers = await _fetch_active_best_offers(token=token, item_id=item_id)
+        if not ok:
+            errors.append(f"{item_id}: {detail[:80]}")
+            continue
+        for off in offers:
+            offer_id = off.get("ebay_offer_id")
+            if not offer_id:
+                continue
+            with db() as conn:
+                # Idempotent insert
+                existing = conn.execute(
+                    """SELECT id FROM buyer_offers
+                        WHERE account_id = ? AND ebay_offer_id = ?""",
+                    (account_id, offer_id),
+                ).fetchone()
+                if existing:
+                    row_id = existing["id"]
+                    new_offer = False
+                else:
+                    cur = conn.execute(
+                        """INSERT INTO buyer_offers
+                              (account_id, ebay_offer_id, ebay_item_id, asin,
+                               buyer_username, offer_price, list_price, currency,
+                               quantity, buyer_message, status, expires_at, received_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            account_id, offer_id, item_id, listing["asin"],
+                            off.get("buyer_username"), off.get("offer_price"), list_price,
+                            off.get("currency"), off.get("quantity"),
+                            off.get("buyer_message"), "pending",
+                            off.get("expires_at") or None, now_iso,
+                        ),
+                    )
+                    row_id = cur.lastrowid
+                    inserted += 1
+                    new_offer = True
+
+            # Apply auto-action only when we first see the offer
+            if new_offer:
+                action = _apply_best_offer_auto_rule(
+                    offer_row_id=row_id,
+                    offer_price=float(off.get("offer_price") or 0),
+                    list_price=list_price,
+                )
+                if action:
+                    counter_price = None
+                    if action == "counter":
+                        try:
+                            counter_pct = float(get_settings_dict().get("best_offer_counter_percent") or 0)
+                        except (TypeError, ValueError):
+                            counter_pct = 0
+                        if counter_pct > 0:
+                            counter_price = round(list_price * counter_pct / 100, 2)
+                    ok_r, detail_r = await _respond_to_best_offer(
+                        token=token, item_id=item_id, offer_id=offer_id,
+                        action=action.capitalize(), counter_price=counter_price,
+                    )
+                    new_status = (
+                        "accepted" if action == "accept" and ok_r else
+                        "declined" if action == "decline" and ok_r else
+                        "countered" if action == "counter" and ok_r else
+                        "auto_failed"
+                    )
+                    with db() as conn:
+                        conn.execute(
+                            """UPDATE buyer_offers
+                                  SET status = ?, auto_action = ?,
+                                      responded_at = ?, error = ?
+                                WHERE id = ?""",
+                            (new_status, action,
+                             now_iso if ok_r else None,
+                             detail_r if not ok_r else None,
+                             row_id),
+                        )
+                    if ok_r:
+                        auto_acted += 1
+
+    return {"ok": True, "account_id": account_id,
+            "listings_checked": len(listings), "new_offers": inserted,
+            "auto_acted": auto_acted, "errors": errors[:10]}
+
+
+async def poll_best_offers_for_all_accounts() -> dict[str, Any]:
+    """Fan-out poll across every connected eBay account."""
+    with db() as conn:
+        rows = conn.execute("SELECT id FROM ebay_accounts").fetchall()
+    if not rows:
+        return {"ok": True, "accounts": 0, "details": []}
+    out = []
+    for r in rows:
+        try:
+            out.append(await poll_best_offers_for_account(account_id=r["id"]))
+        except Exception as e:  # noqa: BLE001 — never break the scheduler
+            out.append({"ok": False, "account_id": r["id"], "error": str(e)[:200]})
+    return {"ok": True, "accounts": len(rows), "details": out}
+
+
 def _slugify(s: str) -> str:
     out = "".join(c if c.isalnum() else "_" for c in s.strip().lower())
     return "_".join(filter(None, out.split("_")))[:60] or "template"
@@ -4018,6 +4344,80 @@ class InboundRuleTestIn(BaseModel):
     body: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Routes — Buyer offers / Best Offer (Phase 3.2)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/best-offers")
+def list_best_offers(status: Optional[str] = None, limit: int = 200):
+    sql = "SELECT * FROM buyer_offers WHERE 1=1"
+    params: list[Any] = []
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY received_at DESC LIMIT ?"
+    params.append(int(limit))
+    with db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/best-offers/poll-now")
+async def api_poll_best_offers():
+    return await poll_best_offers_for_all_accounts()
+
+
+class BestOfferRespondIn(BaseModel):
+    action: str  # "accept" | "decline" | "counter"
+    counter_price: Optional[float] = None
+    seller_response: Optional[str] = None
+
+
+@app.post("/api/best-offers/{offer_id}/respond")
+async def api_respond_best_offer(offer_id: int, payload: BestOfferRespondIn):
+    """Manual accept / decline / counter for a Best Offer row."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM buyer_offers WHERE id = ?", (offer_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "offer not found")
+    if row["status"] not in ("pending", "auto_failed"):
+        raise HTTPException(400, f"offer is already {row['status']}")
+
+    action = payload.action.strip().lower()
+    if action not in ("accept", "decline", "counter"):
+        raise HTTPException(400, "action must be accept | decline | counter")
+
+    try:
+        token = await get_valid_token(account_id=row["account_id"])
+    except HTTPException as e:
+        raise
+
+    ok, detail = await _respond_to_best_offer(
+        token=token,
+        item_id=row["ebay_item_id"],
+        offer_id=row["ebay_offer_id"],
+        action=action.capitalize(),
+        counter_price=payload.counter_price,
+        seller_response=payload.seller_response,
+    )
+    new_status = {"accept": "accepted", "decline": "declined", "counter": "countered"}[action]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """UPDATE buyer_offers
+                  SET status = ?, auto_action = ?, responded_at = ?, error = ?
+                WHERE id = ?""",
+            (new_status if ok else "auto_failed",
+             f"manual_{action}", now_iso if ok else None,
+             None if ok else detail, offer_id),
+        )
+    if not ok:
+        raise HTTPException(502, f"eBay rejected: {detail}")
+    return {"ok": True, "status": new_status}
+
+
 @app.post("/api/inbound-rules/test")
 def test_inbound_rule(payload: InboundRuleTestIn):
     """Run the rule classifier against an arbitrary subject+body. Used by the
@@ -4059,7 +4459,8 @@ def api_scheduler_status():
 @app.post("/api/scheduler/run-now/{job_id}")
 async def api_scheduler_run_now(job_id: str):
     """Fire a specific scheduler job immediately (useful for sandbox testing)."""
-    valid = {"message_flush", "order_sync", "tracking_refresh", "inbox_poll", "feedback_followup"}
+    valid = {"message_flush", "order_sync", "tracking_refresh", "inbox_poll",
+             "feedback_followup", "best_offer_poll"}
     if job_id not in valid:
         raise HTTPException(400, f"unknown job '{job_id}'. expected one of {sorted(valid)}")
     if job_id == "message_flush":
@@ -4072,6 +4473,8 @@ async def api_scheduler_run_now(job_id: str):
         return await poll_inbound_for_all_accounts(lookback_days=7)
     if job_id == "feedback_followup":
         return queue_overdue_feedback_requests()
+    if job_id == "best_offer_poll":
+        return await poll_best_offers_for_all_accounts()
     raise HTTPException(500, "unreachable")
 
 
