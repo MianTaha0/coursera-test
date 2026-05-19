@@ -28,8 +28,10 @@ import os
 import secrets
 import sqlite3
 import time
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, date, timezone
+from html import escape as html_escape
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -53,6 +55,10 @@ FRONTEND_URL       = os.getenv("FRONTEND_URL", "http://localhost:3000")
 EBAY_AUTH_BASE  = "https://auth.sandbox.ebay.com"  if EBAY_SANDBOX else "https://auth.ebay.com"
 EBAY_API_BASE   = "https://api.sandbox.ebay.com"   if EBAY_SANDBOX else "https://api.ebay.com"
 EBAY_TOKEN_URL  = f"{EBAY_API_BASE}/identity/v1/oauth2/token"
+# Legacy Trading API endpoint — still the only supported channel for buyer messages.
+EBAY_TRADING_URL = f"{EBAY_API_BASE}/ws/api.dll"
+EBAY_TRADING_COMPAT_LEVEL = "1193"
+EBAY_TRADING_SITE_ID = os.getenv("EBAY_TRADING_SITE_ID", "0")  # 0 = US, 3 = UK, 77 = DE …
 
 EBAY_SCOPES = " ".join([
     "https://api.ebay.com/oauth/api_scope",
@@ -221,6 +227,15 @@ def init_db() -> None:
             if existing == 0:
                 conn.execute("DROP TABLE orders")
 
+        # Additive migration for outbound_messages: track per-row send errors.
+        cur = conn.execute("PRAGMA table_info(outbound_messages)").fetchall()
+        if cur:
+            ocols = {c["name"] for c in cur}
+            if "error" not in ocols:
+                conn.execute("ALTER TABLE outbound_messages ADD COLUMN error TEXT")
+            if "last_attempt_at" not in ocols:
+                conn.execute("ALTER TABLE outbound_messages ADD COLUMN last_attempt_at TEXT")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 asin TEXT PRIMARY KEY,
@@ -331,7 +346,9 @@ def init_db() -> None:
                     (keyword.lower(), reason, level, now),
                 )
 
-        # Outbound buyer messages (queued by event triggers, sent manually for now)
+        # Outbound buyer messages. Queued by event triggers (order_confirmed,
+        # shipped, delivered, …), then flushed to eBay's Trading API by the
+        # scheduler. `status` ∈ {queued, sent, failed}.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS outbound_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -342,7 +359,9 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'queued',
                 trigger_event TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                sent_at TEXT
+                sent_at TEXT,
+                error TEXT,
+                last_attempt_at TEXT
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbound_order ON outbound_messages(ebay_order_id, created_at DESC)")
@@ -1954,6 +1973,142 @@ def queue_buyer_message(
         return cur.lastrowid
 
 
+async def _send_member_message(
+    *, token: str, item_id: str, recipient_username: str,
+    subject: str, body: str, parent_message_id: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Send a buyer message via the eBay Trading API.
+
+    Returns (ok, detail). `detail` is the eBay error message on failure or the
+    Trading API timestamp on success.
+    """
+    parent_xml = (
+        f"<ParentMessageID>{html_escape(parent_message_id)}</ParentMessageID>"
+        if parent_message_id else ""
+    )
+    xml_body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<AddMemberMessageAAQToPartnerRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+        f"  <ItemID>{html_escape(item_id)}</ItemID>"
+        "  <MemberMessage>"
+        f"    <Subject>{html_escape(subject)}</Subject>"
+        f"    <Body>{html_escape(body)}</Body>"
+        "    <QuestionType>General</QuestionType>"
+        f"    <RecipientID>{html_escape(recipient_username)}</RecipientID>"
+        f"    {parent_xml}"
+        "  </MemberMessage>"
+        "</AddMemberMessageAAQToPartnerRequest>"
+    )
+    headers = {
+        "X-EBAY-API-COMPATIBILITY-LEVEL": EBAY_TRADING_COMPAT_LEVEL,
+        "X-EBAY-API-CALL-NAME": "AddMemberMessageAAQToPartner",
+        "X-EBAY-API-SITEID": EBAY_TRADING_SITE_ID,
+        "X-EBAY-API-IAF-TOKEN": token,
+        "Content-Type": "text/xml",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(EBAY_TRADING_URL, content=xml_body, headers=headers)
+    except httpx.HTTPError as e:
+        return (False, f"HTTP error: {e}")
+
+    if r.status_code != 200:
+        return (False, f"HTTP {r.status_code}: {r.text[:300]}")
+
+    # Parse the XML. Trading API namespaces everything under
+    # urn:ebay:apis:eBLBaseComponents — match locally to avoid the ns dance.
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError as e:
+        return (False, f"Bad XML response: {e}")
+
+    def find_text(tag: str) -> str:
+        for el in root.iter():
+            if el.tag.rsplit("}", 1)[-1] == tag and el.text:
+                return el.text.strip()
+        return ""
+
+    ack = find_text("Ack")
+    if ack.lower() in ("success", "warning"):
+        return (True, find_text("Timestamp") or "sent")
+
+    # Failure path: surface the first error short message.
+    short = find_text("ShortMessage") or find_text("LongMessage") or "eBay rejected the message"
+    return (False, short[:300])
+
+
+async def flush_outbound_messages(*, limit: int = 50) -> dict[str, Any]:
+    """Send queued outbound messages to eBay. Returns a summary."""
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT m.id, m.ebay_order_id, m.subject, m.body, m.template_slug,
+                      o.ebay_item_id, o.buyer_username
+                 FROM outbound_messages m
+                 LEFT JOIN orders o ON o.ebay_order_id = m.ebay_order_id
+               WHERE m.status = 'queued'
+               ORDER BY m.id ASC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    if not rows:
+        return {"ok": True, "sent": 0, "failed": 0, "skipped": 0}
+
+    try:
+        token = await get_valid_token()
+    except HTTPException as e:
+        # No connected eBay account — leave messages queued, surface the reason.
+        return {"ok": False, "sent": 0, "failed": 0, "skipped": len(rows),
+                "error": e.detail}
+
+    sent = failed = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for row in rows:
+        item_id = (row["ebay_item_id"] or "").strip()
+        buyer = (row["buyer_username"] or "").strip()
+        if not item_id or not buyer:
+            failed += 1
+            with db() as conn:
+                conn.execute(
+                    """UPDATE outbound_messages
+                          SET status = 'failed',
+                              error = ?,
+                              last_attempt_at = ?
+                        WHERE id = ?""",
+                    ("missing eBay item_id or buyer_username on order", now_iso, row["id"]),
+                )
+            continue
+
+        ok, detail = await _send_member_message(
+            token=token, item_id=item_id, recipient_username=buyer,
+            subject=row["subject"], body=row["body"],
+        )
+        with db() as conn:
+            if ok:
+                conn.execute(
+                    """UPDATE outbound_messages
+                          SET status = 'sent',
+                              sent_at = ?,
+                              last_attempt_at = ?,
+                              error = NULL
+                        WHERE id = ?""",
+                    (now_iso, now_iso, row["id"]),
+                )
+                sent += 1
+            else:
+                conn.execute(
+                    """UPDATE outbound_messages
+                          SET status = 'failed',
+                              error = ?,
+                              last_attempt_at = ?
+                        WHERE id = ?""",
+                    (detail, now_iso, row["id"]),
+                )
+                failed += 1
+
+    return {"ok": True, "sent": sent, "failed": failed, "skipped": 0,
+            "processed": sent + failed}
+
+
 def _slugify(s: str) -> str:
     out = "".join(c if c.isalnum() else "_" for c in s.strip().lower())
     return "_".join(filter(None, out.split("_")))[:60] or "template"
@@ -2059,6 +2214,33 @@ def list_outbound_messages(
     with db() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.post("/api/messages/outbound/flush")
+async def api_flush_outbound(limit: int = 50):
+    """Send all queued outbound buyer messages via the eBay Trading API.
+
+    Called by the scheduler every minute, but also exposed for the dashboard.
+    """
+    return await flush_outbound_messages(limit=limit)
+
+
+@app.post("/api/messages/outbound/{message_id}/retry")
+async def api_retry_outbound(message_id: int):
+    """Re-queue a failed message so the next flush re-attempts delivery."""
+    with db() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM outbound_messages WHERE id = ?", (message_id,)
+        ).fetchone():
+            raise HTTPException(404, "message not found")
+        conn.execute(
+            """UPDATE outbound_messages
+                  SET status = 'queued',
+                      error = NULL
+                WHERE id = ?""",
+            (message_id,),
+        )
+    return {"ok": True}
 
 
 @app.post("/api/messages/outbound/{message_id}/mark-sent")
