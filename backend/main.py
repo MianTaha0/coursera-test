@@ -761,6 +761,13 @@ DEFAULT_SETTINGS = {
     # Description template used at publish time. Empty string = use raw
     # product description (the Amazon bullets).
     "default_description_template_slug": "default",
+    # Tiered markup ladder (Phase 2.6). JSON list of brackets, processed in
+    # order; the first bracket whose `max_price` is null or > amazon_price
+    # wins. Falls back to `markup_percent` if empty.
+    #   [{"max_price": 20, "markup_percent": 35},
+    #    {"max_price": 50, "markup_percent": 25},
+    #    {"max_price": null, "markup_percent": 20}]
+    "margin_rules": "",
 }
 
 
@@ -849,6 +856,64 @@ async def update_offer_price(offer_id: str, price: float, currency: str, marketp
             headers=headers,
         )
         return rpub.status_code in (200, 201)
+
+
+def _parse_margin_rules(raw: str) -> list[dict[str, Any]]:
+    """Best-effort JSON-decode of the saved `margin_rules` string for the
+    settings GET response. Bad input → []."""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(v, list):
+        return []
+    out = []
+    for r in v:
+        if isinstance(r, dict) and "markup_percent" in r:
+            out.append({
+                "max_price": r.get("max_price"),
+                "markup_percent": r.get("markup_percent"),
+            })
+    return out
+
+
+def markup_for_amazon_price(amazon_price: Optional[float]) -> float:
+    """Return the markup-% to apply for a given Amazon price.
+
+    Reads `margin_rules` from settings; brackets are processed in order and
+    the first one matching wins. Falls back to flat `markup_percent` when
+    the ladder is empty or malformed.
+    """
+    cfg = get_settings_dict()
+    raw = (cfg.get("margin_rules") or "").strip()
+    flat = float(cfg.get("markup_percent") or 30)
+    if not raw or amazon_price is None:
+        return flat
+    try:
+        rules = json.loads(raw)
+    except (ValueError, TypeError):
+        return flat
+    if not isinstance(rules, list) or not rules:
+        return flat
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        max_price = rule.get("max_price")
+        try:
+            markup = float(rule.get("markup_percent"))
+        except (TypeError, ValueError):
+            continue
+        if max_price is None:
+            return markup
+        try:
+            if float(amazon_price) <= float(max_price):
+                return markup
+        except (TypeError, ValueError):
+            continue
+    return flat
 
 
 async def update_listing_quantity(
@@ -968,7 +1033,13 @@ async def maybe_auto_reprice(asin: str, new_amazon_price: Optional[float]) -> No
     if not listing or not listing["offer_id"]:
         return
 
-    markup = float(listing["markup_percent"] or cfg.get("markup_percent") or 30)
+    # Margin ladder (Phase 2.6) overrides any per-listing markup. If the
+    # ladder is empty we fall back to the listing's saved markup, then the
+    # flat `markup_percent` setting.
+    if (cfg.get("margin_rules") or "").strip():
+        markup = markup_for_amazon_price(new_amazon_price)
+    else:
+        markup = float(listing["markup_percent"] or cfg.get("markup_percent") or 30)
     min_change_pct = float(cfg.get("min_reprice_change_percent") or 1.0)
     new_listing_price = round(new_amazon_price * (1 + markup / 100), 2)
     old_listing_price = float(listing["last_price"] or 0)
@@ -1841,7 +1912,9 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
 
     listing_price = body.price
     if listing_price is None and product.get("price"):
-        listing_price = round(float(product["price"]) * 1.30, 2)
+        # Use the tiered margin ladder (Phase 2.6) when configured.
+        markup_pct = markup_for_amazon_price(float(product["price"]))
+        listing_price = round(float(product["price"]) * (1 + markup_pct / 100), 2)
     if not listing_price:
         raise HTTPException(400, "No price available. Pass 'price' in the request body.")
 
@@ -2478,6 +2551,9 @@ def api_get_settings():
         # Phase 2.3: which description template to render at publish time.
         # Empty string = skip the template and use the raw Amazon description.
         "default_description_template_slug": s.get("default_description_template_slug", "default"),
+        # Phase 2.6: tiered margin ladder. Empty/invalid JSON ⇒ flat
+        # `markup_percent` is used.
+        "margin_rules": _parse_margin_rules(s.get("margin_rules", "")),
     }
 
 
@@ -2498,6 +2574,7 @@ class SettingsIn(BaseModel):
     easypost_cache_ttl_minutes: Optional[float] = None
     scheduler_enabled: Optional[bool] = None
     default_description_template_slug: Optional[str] = None
+    margin_rules: Optional[list[dict[str, Any]]] = None
 
 
 @app.put("/api/settings")
@@ -2546,6 +2623,24 @@ def api_update_settings(payload: SettingsIn):
         set_setting("scheduler_enabled", "true" if payload.scheduler_enabled else "false")
     if payload.default_description_template_slug is not None:
         set_setting("default_description_template_slug", payload.default_description_template_slug)
+    if payload.margin_rules is not None:
+        # Empty list clears the ladder (fall back to flat markup_percent).
+        cleaned: list[dict[str, Any]] = []
+        for r in payload.margin_rules:
+            if not isinstance(r, dict):
+                continue
+            try:
+                markup = float(r.get("markup_percent"))
+            except (TypeError, ValueError):
+                continue
+            max_p = r.get("max_price")
+            if max_p is not None:
+                try:
+                    max_p = float(max_p)
+                except (TypeError, ValueError):
+                    continue
+            cleaned.append({"max_price": max_p, "markup_percent": markup})
+        set_setting("margin_rules", json.dumps(cleaned))
     return api_get_settings()
 
 

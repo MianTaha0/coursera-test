@@ -406,7 +406,7 @@ function AutoRepriceSection() {
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <label className="text-xs uppercase text-muted">Markup %</label>
+              <label className="text-xs uppercase text-muted">Flat markup %</label>
               <input
                 type="number"
                 step="0.5"
@@ -416,7 +416,8 @@ function AutoRepriceSection() {
                 disabled={!s.auto_reprice_enabled}
               />
               <p className="mt-1 text-xs text-muted">
-                eBay price = Amazon price × (1 + markup/100)
+                Used when the tiered ladder below is empty. eBay price =
+                Amazon × (1 + markup/100).
               </p>
             </div>
             <div>
@@ -436,6 +437,105 @@ function AutoRepriceSection() {
               </p>
             </div>
           </div>
+
+          <MarginLadderEditor
+            rules={s.margin_rules || []}
+            disabled={!s.auto_reprice_enabled}
+            onChange={(rules) => patch({ margin_rules: rules })}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MarginLadderEditor({
+  rules,
+  disabled,
+  onChange,
+}: {
+  rules: { max_price: number | null; markup_percent: number }[];
+  disabled: boolean;
+  onChange: (rules: { max_price: number | null; markup_percent: number }[]) => void;
+}) {
+  function update(i: number, patch: Partial<{ max_price: number | null; markup_percent: number }>) {
+    const next = rules.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
+    onChange(next);
+  }
+  function add() {
+    onChange([...rules, { max_price: rules.length === 0 ? 20 : null, markup_percent: 25 }]);
+  }
+  function remove(i: number) {
+    onChange(rules.filter((_, idx) => idx !== i));
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-panel2 p-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-xs uppercase text-muted">Tiered margin ladder</div>
+          <p className="mt-1 text-xs text-muted">
+            Applied in order. The first row whose <i>up to</i> price covers the
+            Amazon price wins. Leave the cap blank for the top row.
+          </p>
+        </div>
+        <button
+          onClick={add}
+          disabled={disabled}
+          className="btn-secondary text-xs"
+          title="Add a price bracket"
+        >
+          <Plus size={12} /> Add tier
+        </button>
+      </div>
+
+      {rules.length === 0 ? (
+        <div className="mt-3 rounded border border-dashed border-border bg-panel px-3 py-3 text-xs text-muted">
+          No tiers configured — the flat markup above is used.
+        </div>
+      ) : (
+        <div className="mt-3 space-y-2">
+          {rules.map((r, i) => (
+            <div key={i} className="grid grid-cols-[1fr,1fr,auto] gap-2">
+              <div>
+                <label className="text-xs text-muted">Up to (Amazon price)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={r.max_price ?? ""}
+                  placeholder="∞ (top tier)"
+                  onChange={(e) =>
+                    update(i, {
+                      max_price: e.target.value === "" ? null : Number(e.target.value),
+                    })
+                  }
+                  className="input mt-1 w-full"
+                  disabled={disabled}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-muted">Markup %</label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  value={r.markup_percent}
+                  onChange={(e) => update(i, { markup_percent: Number(e.target.value) })}
+                  className="input mt-1 w-full"
+                  disabled={disabled}
+                />
+              </div>
+              <button
+                onClick={() => remove(i)}
+                disabled={disabled}
+                className="btn-danger self-end text-xs"
+                title="Remove tier"
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
         </div>
       )}
     </div>

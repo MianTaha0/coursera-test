@@ -187,6 +187,12 @@ export type AppSettings = {
   easypost_cache_ttl_minutes: number;
   scheduler_enabled?: boolean;
   default_description_template_slug?: string;
+  margin_rules?: MarginRule[];
+};
+
+export type MarginRule = {
+  max_price: number | null;   // null = open-ended (top tier)
+  markup_percent: number;
 };
 
 export type DescriptionTemplate = {
