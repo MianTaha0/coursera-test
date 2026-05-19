@@ -278,6 +278,18 @@ export type OutboundMessage = {
   last_attempt_at?: string | null;
 };
 
+export type InboundRule = {
+  id: number;
+  name: string;
+  pattern: string;
+  is_regex: number;
+  reply_template_slug: string;
+  enabled: number;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type InboundMessage = {
   id: number;
   account_id: number;

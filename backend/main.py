@@ -193,6 +193,33 @@ DEFAULT_MESSAGE_TEMPLATES: list[tuple[str, str, str, str, str]] = [
 ]
 
 
+# Phase 4.3 — seed inbound auto-reply rules.
+# Tuple: (name, pattern, is_regex, reply_template_slug, priority)
+# Lower priority wins. Empty reply_template_slug = flag only (no auto-send).
+DEFAULT_INBOUND_RULES: list[tuple[str, str, int, str, int]] = [
+    (
+        "Damaged / broken item",
+        r"\b(broken|damaged|not work\w*|defective|cracked)\b",
+        1, "", 5,
+    ),
+    (
+        "Where is my order? (WISMO)",
+        r"\b(where\s+is\s+my|track\w*|shipped|when\s+will|hasn'?t\s+arrived|not\s+here\s+yet)\b",
+        1, "shipped", 10,
+    ),
+    (
+        "Cancellation request",
+        r"\b(cancel|refund\s+before|haven'?t\s+shipped)\b",
+        1, "", 20,
+    ),
+    (
+        "Return request",
+        r"\b(return|send\s+back|wrong\s+item|don'?t\s+want)\b",
+        1, "", 30,
+    ),
+]
+
+
 # ---------------------------------------------------------------------------
 # DB
 # ---------------------------------------------------------------------------
@@ -442,6 +469,40 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_needs_reply ON inbound_messages(needs_reply, received_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_order ON inbound_messages(ebay_order_id, received_at DESC)")
 
+        # Inbound auto-reply rules (Phase 4.3). The classifier runs against
+        # each new inbound message in priority order and the first match wins.
+        # An empty `reply_template_slug` means "flag for human" (no auto-reply).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inbound_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                is_regex INTEGER NOT NULL DEFAULT 0,
+                reply_template_slug TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        existing = conn.execute("SELECT COUNT(*) AS c FROM inbound_rules").fetchone()["c"]
+        if existing == 0:
+            now = datetime.now(timezone.utc).isoformat()
+            seed = [
+                # name,                pattern,                                                                       is_regex, reply_template,  priority
+                ("Damaged or broken",  r"(broken|damaged|not.{0,8}work|defective|missing.{0,15}parts|stopped.{0,5}work)", 1, "",         5),
+                ("WISMO",              r"(where.{0,20}order|tracking|shipped.{0,5}yet|when.{0,10}arrive|how.{0,5}long|status.{0,10}order|did.{0,5}ship|haven.{0,5}received)", 1, "shipped", 10),
+                ("Return request",    r"(\breturn\b|refund|send.{0,5}back|don.t.{0,5}want|change.{0,5}mind|exchange)", 1, "",         20),
+                ("Cancellation",      r"(cancel|order.{0,10}wrong|wrong.{0,5}item|wrong.{0,10}size)",                  1, "",         30),
+            ]
+            for name, pattern, is_regex, tpl, prio in seed:
+                conn.execute(
+                    """INSERT INTO inbound_rules
+                         (name, pattern, is_regex, reply_template_slug, enabled, priority, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+                    (name, pattern, is_regex, tpl, prio, now, now),
+                )
+
         # Buyer-message templates
         conn.execute("""
             CREATE TABLE IF NOT EXISTS message_templates (
@@ -465,6 +526,36 @@ def init_db() -> None:
                        (slug, name, kind, subject, body, created_at, updated_at)
                        VALUES (?,?,?,?,?,?,?)""",
                     (slug, name, kind, subject, body, now, now),
+                )
+
+        # Inbound-message routing rules (Phase 4.3). Each rule matches a
+        # pattern against the buyer's message subject + body and either
+        # auto-replies with the named template (reply_template_slug) or just
+        # flags the message for human attention (empty reply_template_slug).
+        # `priority` is processed ascending — lower = higher precedence.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inbound_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                is_regex INTEGER NOT NULL DEFAULT 0,
+                reply_template_slug TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        existing = conn.execute("SELECT COUNT(*) AS c FROM inbound_rules").fetchone()["c"]
+        if existing == 0:
+            now = datetime.now(timezone.utc).isoformat()
+            for name, pattern, is_regex, reply, priority in DEFAULT_INBOUND_RULES:
+                conn.execute(
+                    """INSERT INTO inbound_rules
+                          (name, pattern, is_regex, reply_template_slug,
+                           enabled, priority, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+                    (name, pattern, is_regex, reply, priority, now, now),
                 )
 
         # Description templates — used at publish time to wrap the raw Amazon
@@ -3213,6 +3304,93 @@ async def _fetch_member_messages(
     return (True, "ok", messages)
 
 
+def match_inbound_rule(subject: str, body: str) -> Optional[dict[str, Any]]:
+    """Return the highest-priority enabled rule that matches the message.
+
+    The haystack is "<subject>\\n<body>" lower-cased. is_regex=1 uses
+    re.search with IGNORECASE; otherwise simple lower-case substring match.
+    Bad regex → rule is skipped (logged once).
+    """
+    import re as _re
+    haystack = f"{subject or ''}\n{body or ''}".lower()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM inbound_rules WHERE enabled = 1 ORDER BY priority ASC, id ASC"
+        ).fetchall()
+    for r in rows:
+        pat = r["pattern"] or ""
+        if not pat:
+            continue
+        if r["is_regex"]:
+            try:
+                if _re.search(pat, haystack, _re.IGNORECASE):
+                    return dict(r)
+            except _re.error:
+                continue
+        else:
+            if pat.lower() in haystack:
+                return dict(r)
+    return None
+
+
+def apply_inbound_rule(*, inbound_id: int) -> dict[str, Any]:
+    """Match the saved inbound message against the rule set and (optionally)
+    queue an auto-reply.
+
+    Returns {matched: bool, rule_id, rule_name, auto_replied, outbound_id?, reason?}.
+    The actual eBay send happens via the existing message_flush scheduler job.
+    """
+    with db() as conn:
+        inb = conn.execute(
+            "SELECT * FROM inbound_messages WHERE id = ?", (inbound_id,)
+        ).fetchone()
+    if not inb:
+        return {"matched": False, "reason": "inbound not found"}
+
+    rule = match_inbound_rule(inb["subject"] or "", inb["body"] or "")
+    if not rule:
+        return {"matched": False}
+
+    # Always stamp matched_rule_id so the UI can show which rule fired even
+    # when no auto-reply was queued (e.g. damage / return rules just flag).
+    with db() as conn:
+        conn.execute(
+            "UPDATE inbound_messages SET matched_rule_id = ? WHERE id = ?",
+            (rule["id"], inbound_id),
+        )
+
+    slug = (rule["reply_template_slug"] or "").strip()
+    if not slug:
+        return {"matched": True, "rule_id": rule["id"], "rule_name": rule["name"],
+                "auto_replied": False, "reason": "rule has no reply template"}
+
+    # Auto-reply requires an order_id (queue_buyer_message joins on orders).
+    order_id = (inb["ebay_order_id"] or "").strip()
+    if not order_id:
+        return {"matched": True, "rule_id": rule["id"], "rule_name": rule["name"],
+                "auto_replied": False, "reason": "no ebay_order_id on inbound"}
+
+    msg_id = queue_buyer_message(
+        ebay_order_id=order_id,
+        trigger_event=f"auto_reply_rule_{rule['id']}",
+        template_slug=slug,
+    )
+    if not msg_id:
+        return {"matched": True, "rule_id": rule["id"], "rule_name": rule["name"],
+                "auto_replied": False, "reason": "queue failed (template missing or already queued)"}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """UPDATE inbound_messages
+                  SET auto_replied = 1, replied_at = ?, needs_reply = 0
+                WHERE id = ?""",
+            (now_iso, inbound_id),
+        )
+    return {"matched": True, "rule_id": rule["id"], "rule_name": rule["name"],
+            "auto_replied": True, "outbound_id": msg_id}
+
+
 async def poll_inbound_for_account(
     *, account_id: int, lookback_days: int = 7,
 ) -> dict[str, Any]:
@@ -3244,6 +3422,9 @@ async def poll_inbound_for_account(
         return {"ok": False, "account_id": account_id, "error": detail}
 
     inserted = 0
+    auto_replied = 0
+    flagged = 0
+    new_ids: list[int] = []
     now_iso = now.isoformat()
     with db() as conn:
         for m in messages:
@@ -3251,7 +3432,7 @@ async def poll_inbound_for_account(
             if not mid:
                 continue
             try:
-                conn.execute(
+                cur = conn.execute(
                     """INSERT INTO inbound_messages
                           (account_id, ebay_message_id, ebay_order_id, ebay_item_id,
                            sender_username, subject, body, received_at, fetched_at, raw_json)
@@ -3269,13 +3450,27 @@ async def poll_inbound_for_account(
                     ),
                 )
                 inserted += 1
+                if cur.lastrowid:
+                    new_ids.append(int(cur.lastrowid))
             except sqlite3.IntegrityError:
                 # Already have this MessageID for this account
                 pass
 
+    # Phase 4.3 — run the rule engine over each NEW inbound row.
+    for iid in new_ids:
+        try:
+            res = apply_inbound_rule(inbound_id=iid)
+            if res.get("matched"):
+                if res.get("auto_replied"):
+                    auto_replied += 1
+                else:
+                    flagged += 1
+        except Exception:  # noqa: BLE001 — never break the polling loop
+            continue
+
     set_setting(last_key, now_iso)
     return {"ok": True, "account_id": account_id, "fetched": len(messages),
-            "inserted": inserted}
+            "inserted": inserted, "auto_replied": auto_replied, "flagged": flagged}
 
 
 async def poll_inbound_for_all_accounts(*, lookback_days: int = 7) -> dict[str, Any]:
@@ -3562,6 +3757,92 @@ def api_inbox_delete(message_id: int):
     with db() as conn:
         cur = conn.execute("DELETE FROM inbound_messages WHERE id = ?", (message_id,))
     return {"ok": True, "deleted": cur.rowcount}
+
+
+# ---------------------------------------------------------------------------
+# Routes — inbound auto-reply rules (Phase 4.3)
+# ---------------------------------------------------------------------------
+
+class InboundRuleIn(BaseModel):
+    name: str
+    pattern: str
+    is_regex: bool = False
+    reply_template_slug: str = ""
+    enabled: bool = True
+    priority: int = 100
+
+
+def _row_to_inbound_rule(r: sqlite3.Row) -> dict[str, Any]:
+    return dict(r)
+
+
+@app.get("/api/inbound-rules")
+def list_inbound_rules():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM inbound_rules ORDER BY priority ASC, id ASC"
+        ).fetchall()
+    return [_row_to_inbound_rule(r) for r in rows]
+
+
+@app.post("/api/inbound-rules")
+def create_inbound_rule(payload: InboundRuleIn):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT INTO inbound_rules
+                  (name, pattern, is_regex, reply_template_slug, enabled,
+                   priority, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (payload.name, payload.pattern, 1 if payload.is_regex else 0,
+             payload.reply_template_slug, 1 if payload.enabled else 0,
+             payload.priority, now, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM inbound_rules WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return _row_to_inbound_rule(row)
+
+
+@app.put("/api/inbound-rules/{rule_id}")
+def update_inbound_rule(rule_id: int, payload: InboundRuleIn):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM inbound_rules WHERE id = ?", (rule_id,)).fetchone():
+            raise HTTPException(404, "rule not found")
+        conn.execute(
+            """UPDATE inbound_rules
+                  SET name = ?, pattern = ?, is_regex = ?,
+                      reply_template_slug = ?, enabled = ?, priority = ?,
+                      updated_at = ?
+                WHERE id = ?""",
+            (payload.name, payload.pattern, 1 if payload.is_regex else 0,
+             payload.reply_template_slug, 1 if payload.enabled else 0,
+             payload.priority, now, rule_id),
+        )
+        row = conn.execute("SELECT * FROM inbound_rules WHERE id = ?", (rule_id,)).fetchone()
+    return _row_to_inbound_rule(row)
+
+
+@app.delete("/api/inbound-rules/{rule_id}")
+def delete_inbound_rule(rule_id: int):
+    with db() as conn:
+        cur = conn.execute("DELETE FROM inbound_rules WHERE id = ?", (rule_id,))
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+class InboundRuleTestIn(BaseModel):
+    subject: str = ""
+    body: str = ""
+
+
+@app.post("/api/inbound-rules/test")
+def test_inbound_rule(payload: InboundRuleTestIn):
+    """Run the rule classifier against an arbitrary subject+body. Used by the
+    rule editor to preview which rule (if any) a sample message would match.
+    """
+    rule = match_inbound_rule(payload.subject, payload.body)
+    return {"matched": rule is not None, "rule": rule}
 
 
 # ---------------------------------------------------------------------------

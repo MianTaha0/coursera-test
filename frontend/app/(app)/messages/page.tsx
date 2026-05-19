@@ -13,7 +13,7 @@ import {
   RefreshCw,
   Bot,
 } from "lucide-react";
-import { api, InboundMessage, MessageTemplate, OutboundMessage } from "@/lib/api";
+import { api, InboundMessage, InboundRule, MessageTemplate, OutboundMessage } from "@/lib/api";
 
 const TEMPLATE_VARIABLES = [
   "buyer_name",
@@ -44,7 +44,7 @@ function fillTemplate(text: string, vars: Record<string, string>): string {
 }
 
 export default function MessagesPage() {
-  const [tab, setTab] = useState<"inbox" | "templates">("inbox");
+  const [tab, setTab] = useState<"inbox" | "templates" | "rules">("inbox");
   const [unread, setUnread] = useState<number>(0);
 
   // Poll the unread count so the tab badge stays current.
@@ -92,10 +92,20 @@ export default function MessagesPage() {
           >
             <MessageSquare size={14} /> Templates
           </button>
+          <button
+            onClick={() => setTab("rules")}
+            className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-sm ${
+              tab === "rules" ? "bg-accent/15 text-accent" : "text-muted hover:text-white"
+            }`}
+          >
+            <Bot size={14} /> Auto-reply rules
+          </button>
         </div>
       </div>
 
-      {tab === "inbox" ? <InboxView onUnreadChange={setUnread} /> : <TemplatesView />}
+      {tab === "inbox" && <InboxView onUnreadChange={setUnread} />}
+      {tab === "templates" && <TemplatesView />}
+      {tab === "rules" && <RulesView />}
     </div>
   );
 }
@@ -666,3 +676,275 @@ function ThreadView({
   );
 }
 
+// ===========================================================================
+// Auto-reply rules (Phase 4.3) — pattern → reply template ladder
+// ===========================================================================
+
+function RulesView() {
+  const [rules, setRules] = useState<InboundRule[] | null>(null);
+  const [templates, setTemplates] = useState<MessageTemplate[]>([]);
+  const [busy, setBusy] = useState<number | "new" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [testSubject, setTestSubject] = useState("");
+  const [testBody, setTestBody] = useState("Hi, where is my order? Has it shipped yet?");
+  const [testResult, setTestResult] = useState<{
+    matched: boolean;
+    rule: InboundRule | null;
+  } | null>(null);
+
+  async function load() {
+    setError(null);
+    try {
+      const [rs, ts] = await Promise.all([
+        api<InboundRule[]>("/api/inbound-rules"),
+        api<MessageTemplate[]>("/api/message-templates"),
+      ]);
+      setRules(rs);
+      setTemplates(ts);
+    } catch (e: any) {
+      setError(e.message || "Failed to load rules");
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function patch(r: InboundRule, update: Partial<InboundRule>) {
+    setBusy(r.id);
+    try {
+      const next: any = {
+        name: r.name,
+        pattern: r.pattern,
+        is_regex: !!r.is_regex,
+        reply_template_slug: r.reply_template_slug,
+        enabled: !!r.enabled,
+        priority: r.priority,
+        ...update,
+      };
+      await api(`/api/inbound-rules/${r.id}`, {
+        method: "PUT",
+        body: JSON.stringify(next),
+      });
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Save failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function create() {
+    setBusy("new");
+    try {
+      await api("/api/inbound-rules", {
+        method: "POST",
+        body: JSON.stringify({
+          name: "New rule",
+          pattern: "",
+          is_regex: false,
+          reply_template_slug: "",
+          enabled: true,
+          priority: 100,
+        }),
+      });
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Create failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function remove(r: InboundRule) {
+    if (!confirm(`Delete rule "${r.name}"?`)) return;
+    setBusy(r.id);
+    try {
+      await api(`/api/inbound-rules/${r.id}`, { method: "DELETE" });
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Delete failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runTest() {
+    try {
+      const r = await api<{ matched: boolean; rule: InboundRule | null }>(
+        "/api/inbound-rules/test",
+        { method: "POST", body: JSON.stringify({ subject: testSubject, body: testBody }) },
+      );
+      setTestResult(r);
+    } catch (e: any) {
+      setError(e.message || "Test failed");
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-muted">
+          Rules are checked in priority order (lower = higher priority). The
+          first match wins. A rule with a reply template will auto-send when
+          matched on a message tied to an eBay order; a rule with no template
+          just flags the message for human attention.
+        </p>
+        <button onClick={create} disabled={busy === "new"} className="btn-primary text-xs">
+          {busy === "new" ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
+          New rule
+        </button>
+      </div>
+
+      {error && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+          {error}
+        </div>
+      )}
+
+      {/* Test playground */}
+      <div className="card">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Bot size={14} className="text-accent" /> Test the classifier
+        </div>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div>
+            <label className="text-xs uppercase text-muted">Subject</label>
+            <input
+              value={testSubject}
+              onChange={(e) => setTestSubject(e.target.value)}
+              className="input mt-1 w-full"
+              placeholder="(optional)"
+            />
+          </div>
+          <div>
+            <label className="text-xs uppercase text-muted">Body</label>
+            <input
+              value={testBody}
+              onChange={(e) => setTestBody(e.target.value)}
+              className="input mt-1 w-full"
+            />
+          </div>
+        </div>
+        <div className="mt-3 flex items-center gap-3">
+          <button onClick={runTest} className="btn-secondary text-xs">
+            Run match
+          </button>
+          {testResult && (
+            <div className="text-xs">
+              {testResult.matched && testResult.rule ? (
+                <span className="text-accent">
+                  ✓ Matched: <b>{testResult.rule.name}</b>{" "}
+                  {testResult.rule.reply_template_slug ? (
+                    <>
+                      → auto-reply with <code>{testResult.rule.reply_template_slug}</code>
+                    </>
+                  ) : (
+                    <>→ flag only (needs human)</>
+                  )}
+                </span>
+              ) : (
+                <span className="text-muted">No rule matched.</span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Rule rows */}
+      {rules === null ? (
+        <div className="card text-muted">Loading…</div>
+      ) : (
+        <div className="card space-y-2 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs uppercase text-muted">
+              <tr>
+                <th className="text-left py-2 px-2">Prio</th>
+                <th className="text-left py-2 px-2">Name</th>
+                <th className="text-left py-2 px-2">Pattern</th>
+                <th className="text-left py-2 px-2">Regex?</th>
+                <th className="text-left py-2 px-2">Reply with</th>
+                <th className="text-left py-2 px-2">Enabled</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {rules.map((r) => (
+                <tr key={r.id} className="border-t border-border">
+                  <td className="px-2 py-2 w-16">
+                    <input
+                      type="number"
+                      value={r.priority}
+                      onChange={(e) => patch(r, { priority: Number(e.target.value) })}
+                      className="input w-14 text-xs"
+                      disabled={busy === r.id}
+                    />
+                  </td>
+                  <td className="px-2 py-2">
+                    <input
+                      type="text"
+                      value={r.name}
+                      onChange={(e) => patch(r, { name: e.target.value })}
+                      className="input w-full text-xs"
+                      disabled={busy === r.id}
+                    />
+                  </td>
+                  <td className="px-2 py-2">
+                    <input
+                      type="text"
+                      value={r.pattern}
+                      onChange={(e) => patch(r, { pattern: e.target.value })}
+                      className="input w-full font-mono text-xs"
+                      disabled={busy === r.id}
+                    />
+                  </td>
+                  <td className="px-2 py-2 text-center">
+                    <input
+                      type="checkbox"
+                      checked={!!r.is_regex}
+                      onChange={(e) => patch(r, { is_regex: e.target.checked ? 1 : 0 })}
+                      disabled={busy === r.id}
+                    />
+                  </td>
+                  <td className="px-2 py-2">
+                    <select
+                      value={r.reply_template_slug}
+                      onChange={(e) => patch(r, { reply_template_slug: e.target.value })}
+                      className="input w-full text-xs"
+                      disabled={busy === r.id}
+                    >
+                      <option value="">— flag only —</option>
+                      {templates.map((t) => (
+                        <option key={t.slug} value={t.slug}>
+                          {t.slug}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="px-2 py-2 text-center">
+                    <input
+                      type="checkbox"
+                      checked={!!r.enabled}
+                      onChange={(e) => patch(r, { enabled: e.target.checked ? 1 : 0 })}
+                      disabled={busy === r.id}
+                    />
+                  </td>
+                  <td className="px-2 py-2">
+                    <button
+                      onClick={() => remove(r)}
+                      disabled={busy === r.id}
+                      className="btn-danger text-xs"
+                      title="Delete rule"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
