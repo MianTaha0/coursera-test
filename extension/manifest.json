@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Droply — Save Amazon products",
-  "version": "1.0.0",
-  "description": "One-click capture of Amazon product data. Self-contained — saves to your browser, no account needed.",
+  "name": "Droply — Save Amazon & AliExpress products",
+  "version": "1.1.0",
+  "description": "One-click capture of Amazon and AliExpress product data. Saves to your browser and syncs to your Droply dashboard.",
   "permissions": ["activeTab", "storage", "scripting", "tabs", "alarms", "notifications"],
   "background": {
     "service_worker": "background.js"
@@ -19,7 +19,15 @@
     "https://www.amazon.de/*",
     "https://www.amazon.fr/*",
     "https://www.amazon.it/*",
-    "https://www.amazon.es/*"
+    "https://www.amazon.es/*",
+    "https://www.aliexpress.com/*",
+    "https://www.aliexpress.us/*",
+    "https://es.aliexpress.com/*",
+    "https://fr.aliexpress.com/*",
+    "https://de.aliexpress.com/*",
+    "https://it.aliexpress.com/*",
+    "https://pt.aliexpress.com/*",
+    "https://nl.aliexpress.com/*"
   ],
   "action": {
     "default_title": "Droply",
@@ -60,6 +68,20 @@
         "https://www.amazon.es/gp/product/*"
       ],
       "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.aliexpress.com/item/*",
+        "https://www.aliexpress.us/item/*",
+        "https://es.aliexpress.com/item/*",
+        "https://fr.aliexpress.com/item/*",
+        "https://de.aliexpress.com/item/*",
+        "https://it.aliexpress.com/item/*",
+        "https://pt.aliexpress.com/item/*",
+        "https://nl.aliexpress.com/item/*"
+      ],
+      "js": ["content-aliexpress.js"],
       "run_at": "document_idle"
     }
   ]
