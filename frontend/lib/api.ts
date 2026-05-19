@@ -185,6 +185,17 @@ export type AppSettings = {
   amazon_shipping_cost: number;
   easypost_api_key_set: boolean;
   easypost_cache_ttl_minutes: number;
+  scheduler_enabled?: boolean;
+  default_description_template_slug?: string;
+};
+
+export type DescriptionTemplate = {
+  id: number;
+  slug: string;
+  name: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
 };
 
 // Partial settings payload accepted by PUT /api/settings. Includes write-only

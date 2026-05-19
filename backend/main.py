@@ -438,6 +438,41 @@ def init_db() -> None:
                     (slug, name, kind, subject, body, now, now),
                 )
 
+        # Description templates — used at publish time to wrap the raw Amazon
+        # description with seller branding, shipping/returns notices, etc.
+        # Variables supported: {title} {brand} {asin} {description} {price}
+        # {currency} plus any key from the product's spec_table.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS description_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        existing = conn.execute("SELECT COUNT(*) AS c FROM description_templates").fetchone()["c"]
+        if existing == 0:
+            now = datetime.now(timezone.utc).isoformat()
+            default_body = (
+                "<p><b>{title}</b></p>\n"
+                "<p><b>Brand:</b> {brand}</p>\n"
+                "<p>{description}</p>\n"
+                "<hr>\n"
+                "<ul>\n"
+                "  <li>Brand new in original packaging</li>\n"
+                "  <li>Fast dispatch from a trusted seller</li>\n"
+                "  <li>30-day returns accepted</li>\n"
+                "</ul>"
+            )
+            conn.execute(
+                """INSERT INTO description_templates
+                   (slug, name, body, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                ("default", "Default", default_body, now, now),
+            )
+
         # Price/stock snapshots — one row per change, never updated
         conn.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
@@ -723,6 +758,9 @@ DEFAULT_SETTINGS = {
     "easypost_cache_ttl_minutes": "60",  # Re-poll EasyPost at most this often per (carrier, number)
     # Background scheduler — when "true", APScheduler runs the recurring jobs
     "scheduler_enabled": "true",
+    # Description template used at publish time. Empty string = use raw
+    # product description (the Amazon bullets).
+    "default_description_template_slug": "default",
 }
 
 
@@ -1810,7 +1848,9 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
     sku = f"DROPLY-{asin}"
     merchant_location_key, merchant_location_addr = _merchant_location_for(marketplace_id)
     title = (body.title or product.get("title") or asin)[:80]
-    description = product.get("description") or title
+    # Render the configured description template (falls back to raw bullets
+    # when no template is set or the slug doesn't resolve).
+    description = render_description_for_product(product) or product.get("description") or title
     images = product.get("images") or []
 
     # --- Resolve eBay category (Taxonomy API) ---
@@ -2435,6 +2475,9 @@ def api_get_settings():
         "easypost_cache_ttl_minutes": float(s.get("easypost_cache_ttl_minutes", "60")),
         # In-process job scheduler
         "scheduler_enabled": s.get("scheduler_enabled", "true").lower() == "true",
+        # Phase 2.3: which description template to render at publish time.
+        # Empty string = skip the template and use the raw Amazon description.
+        "default_description_template_slug": s.get("default_description_template_slug", "default"),
     }
 
 
@@ -2454,6 +2497,7 @@ class SettingsIn(BaseModel):
     easypost_api_key: Optional[str] = None
     easypost_cache_ttl_minutes: Optional[float] = None
     scheduler_enabled: Optional[bool] = None
+    default_description_template_slug: Optional[str] = None
 
 
 @app.put("/api/settings")
@@ -2500,6 +2544,8 @@ def api_update_settings(payload: SettingsIn):
         set_setting("easypost_cache_ttl_minutes", str(payload.easypost_cache_ttl_minutes))
     if payload.scheduler_enabled is not None:
         set_setting("scheduler_enabled", "true" if payload.scheduler_enabled else "false")
+    if payload.default_description_template_slug is not None:
+        set_setting("default_description_template_slug", payload.default_description_template_slug)
     return api_get_settings()
 
 
@@ -2522,6 +2568,41 @@ def _render_template_text(text: str, vars: dict[str, str]) -> str:
     for k, v in vars.items():
         text = text.replace("{" + k + "}", str(v or ""))
     return text
+
+
+def render_description_for_product(product: dict[str, Any]) -> str:
+    """Render the configured default description template for a product.
+
+    Variables: {title} {brand} {asin} {description} {price} {currency} +
+    any key from product.spec_table (e.g. {Color}, {Connectivity}). When no
+    template is configured (empty slug) or the slug doesn't exist, falls
+    back to the raw product description.
+    """
+    cfg = get_settings_dict()
+    slug = (cfg.get("default_description_template_slug") or "").strip()
+    raw = product.get("description") or product.get("title") or ""
+    if not slug:
+        return raw
+    with db() as conn:
+        tpl = conn.execute(
+            "SELECT body FROM description_templates WHERE slug = ?", (slug,)
+        ).fetchone()
+    if not tpl:
+        return raw
+    spec = product.get("spec_table") or {}
+    vars: dict[str, str] = {
+        "title":       str(product.get("title") or ""),
+        "brand":       str(product.get("brand") or ""),
+        "asin":        str(product.get("asin") or ""),
+        "description": str(raw),
+        "price":       str(product.get("price") or ""),
+        "currency":    str(product.get("currency") or ""),
+    }
+    if isinstance(spec, dict):
+        for k, v in spec.items():
+            if k and isinstance(k, str):
+                vars[k] = str(v or "")
+    return _render_template_text(tpl["body"], vars)
 
 
 def _order_to_template_vars(order: sqlite3.Row) -> dict[str, str]:
@@ -3013,6 +3094,124 @@ def render_template(template_id: int, payload: RenderIn):
     return {
         "subject": safe_sub(row["subject"]),
         "body": safe_sub(row["body"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Routes — description templates (Phase 2.3)
+# ---------------------------------------------------------------------------
+
+class DescriptionTemplateIn(BaseModel):
+    slug: Optional[str] = None
+    name: str
+    body: str
+
+
+def _row_to_desc_template(r: sqlite3.Row) -> dict[str, Any]:
+    return dict(r)
+
+
+@app.get("/api/description-templates")
+def list_description_templates():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM description_templates ORDER BY id ASC"
+        ).fetchall()
+    return [_row_to_desc_template(r) for r in rows]
+
+
+@app.post("/api/description-templates")
+def create_description_template(payload: DescriptionTemplateIn):
+    now = datetime.now(timezone.utc).isoformat()
+    slug = payload.slug or _slugify(payload.name)
+    with db() as conn:
+        base, n = slug, 2
+        while conn.execute("SELECT 1 FROM description_templates WHERE slug = ?", (slug,)).fetchone():
+            slug = f"{base}_{n}"
+            n += 1
+        cur = conn.execute(
+            """INSERT INTO description_templates (slug, name, body, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (slug, payload.name, payload.body, now, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM description_templates WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return _row_to_desc_template(row)
+
+
+@app.put("/api/description-templates/{template_id}")
+def update_description_template(template_id: int, payload: DescriptionTemplateIn):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM description_templates WHERE id = ?", (template_id,)
+        ).fetchone():
+            raise HTTPException(404, "template not found")
+        conn.execute(
+            """UPDATE description_templates SET name = ?, body = ?, updated_at = ?
+               WHERE id = ?""",
+            (payload.name, payload.body, now, template_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM description_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+    return _row_to_desc_template(row)
+
+
+@app.delete("/api/description-templates/{template_id}")
+def delete_description_template(template_id: int):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT slug FROM description_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+        if row and row["slug"] == "default":
+            raise HTTPException(400, "The 'default' template can't be deleted (it can be edited).")
+        cur = conn.execute("DELETE FROM description_templates WHERE id = ?", (template_id,))
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+@app.post("/api/description-templates/{template_id}/preview")
+def preview_description_template(template_id: int, asin: Optional[str] = None):
+    """Render a template against a real product (or a sample) for the editor preview."""
+    with db() as conn:
+        tpl = conn.execute(
+            "SELECT * FROM description_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+        if not tpl:
+            raise HTTPException(404, "template not found")
+        product: dict[str, Any]
+        if asin:
+            row = conn.execute("SELECT * FROM products WHERE asin = ?", (asin,)).fetchone()
+            product = row_to_product(row) if row else {}
+        else:
+            product = {}
+    if not product:
+        product = {
+            "asin": "B0SAMPLE01",
+            "title": "Sample Wireless Headphones — Noise Cancelling",
+            "brand": "Acme",
+            "description": "• Comfortable over-ear fit\n• 20-hour battery\n• Bluetooth 5.3",
+            "price": 39.99, "currency": "USD",
+            "spec_table": {"Color": "Black", "Connectivity": "Bluetooth"},
+        }
+
+    spec = product.get("spec_table") or {}
+    vars: dict[str, str] = {
+        "title":       str(product.get("title") or ""),
+        "brand":       str(product.get("brand") or ""),
+        "asin":        str(product.get("asin") or ""),
+        "description": str(product.get("description") or ""),
+        "price":       str(product.get("price") or ""),
+        "currency":    str(product.get("currency") or ""),
+    }
+    if isinstance(spec, dict):
+        for k, v in spec.items():
+            if k and isinstance(k, str):
+                vars[k] = str(v or "")
+    return {
+        "rendered": _render_template_text(tpl["body"], vars),
+        "variables": vars,
     }
 
 

@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle, RefreshCw, Calculator, Truck } from "lucide-react";
-import { api, API_URL, AppSettings, computeNet } from "@/lib/api";
+import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle, RefreshCw, Calculator, Truck, FileText, Eye, Plus, Trash2 } from "lucide-react";
+import { api, API_URL, AppSettings, DescriptionTemplate, computeNet } from "@/lib/api";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 
@@ -596,6 +596,269 @@ function AmazonFulfillmentSection() {
   );
 }
 
+function DescriptionTemplatesSection() {
+  const [templates, setTemplates] = useState<DescriptionTemplate[] | null>(null);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [name, setName] = useState("");
+  const [body, setBody] = useState("");
+  const [preview, setPreview] = useState<string>("");
+  const [busy, setBusy] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function loadAll() {
+    try {
+      const [t, s] = await Promise.all([
+        api<DescriptionTemplate[]>("/api/description-templates"),
+        api<AppSettings>("/api/settings"),
+      ]);
+      setTemplates(t);
+      setSettings(s);
+      if (selectedId === null && t.length) {
+        const def = t.find((x) => x.slug === (s.default_description_template_slug || "default")) || t[0];
+        select(def);
+      }
+    } catch (e: any) {
+      setError(e.message || "Failed to load templates");
+    }
+  }
+
+  useEffect(() => {
+    loadAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function select(t: DescriptionTemplate) {
+    setSelectedId(t.id);
+    setName(t.name);
+    setBody(t.body);
+  }
+
+  async function refreshPreview(id: number) {
+    try {
+      const r = await api<{ rendered: string }>(
+        `/api/description-templates/${id}/preview`,
+        { method: "POST" },
+      );
+      setPreview(r.rendered);
+    } catch {
+      setPreview("");
+    }
+  }
+
+  useEffect(() => {
+    if (selectedId !== null) refreshPreview(selectedId);
+  }, [selectedId]);
+
+  async function save() {
+    if (selectedId === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/api/description-templates/${selectedId}`, {
+        method: "PUT",
+        body: JSON.stringify({ name, body }),
+      });
+      await loadAll();
+      await refreshPreview(selectedId);
+      setSavedAt(Date.now());
+    } catch (e: any) {
+      setError(e.message || "Save failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function create() {
+    setBusy(true);
+    setError(null);
+    try {
+      const t = await api<DescriptionTemplate>("/api/description-templates", {
+        method: "POST",
+        body: JSON.stringify({ name: "New template", body: "<p>{title}</p>\n<p>{description}</p>" }),
+      });
+      await loadAll();
+      select(t);
+    } catch (e: any) {
+      setError(e.message || "Create failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    if (selectedId === null) return;
+    if (!confirm(`Delete template "${name}"?`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/api/description-templates/${selectedId}`, { method: "DELETE" });
+      setSelectedId(null);
+      setName("");
+      setBody("");
+      setPreview("");
+      await loadAll();
+    } catch (e: any) {
+      setError(e.message || "Delete failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setDefault(slug: string) {
+    setBusy(true);
+    try {
+      await api<AppSettings>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ default_description_template_slug: slug }),
+      });
+      await loadAll();
+      setSavedAt(Date.now());
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const defaultSlug = settings?.default_description_template_slug || "";
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-3">
+        <FileText size={20} className="text-muted" />
+        <h2 className="text-lg font-semibold">Description templates</h2>
+        {busy && <Loader2 size={14} className="animate-spin text-muted" />}
+        {!busy && savedAt && Date.now() - savedAt < 3000 && (
+          <span className="text-xs text-accent">Saved</span>
+        )}
+        <button
+          onClick={create}
+          className="btn-secondary ml-auto text-xs"
+          disabled={busy}
+          title="Create a new description template"
+        >
+          <Plus size={12} /> New
+        </button>
+      </div>
+
+      <p className="mt-2 text-sm text-muted">
+        Wraps the raw Amazon description with your seller branding when
+        publishing to eBay. Variables: <code>{`{title}`}</code> <code>{`{brand}`}</code>{" "}
+        <code>{`{asin}`}</code> <code>{`{description}`}</code>{" "}
+        <code>{`{price}`}</code> <code>{`{currency}`}</code>, plus any key from
+        the product's spec table (e.g. <code>{`{Color}`}</code>). Basic HTML is
+        OK. The marked-default template is used for every publish.
+      </p>
+
+      {error && (
+        <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+          {error}
+        </div>
+      )}
+
+      {!templates ? (
+        <div className="mt-4 text-sm text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 grid gap-4 lg:grid-cols-[200px,1fr,1fr]">
+          {/* Template list */}
+          <div className="space-y-1">
+            {templates.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => select(t)}
+                className={`block w-full rounded-lg border px-2 py-2 text-left text-sm ${
+                  selectedId === t.id
+                    ? "border-accent/40 bg-accent/5"
+                    : "border-border bg-panel2 hover:border-accent/20"
+                }`}
+              >
+                <div className="truncate font-medium">{t.name}</div>
+                <div className="mt-1 flex items-center gap-1 text-xs text-muted">
+                  <span className="font-mono">{t.slug}</span>
+                  {t.slug === defaultSlug && (
+                    <span className="badge bg-accent/15 text-accent">Default</span>
+                  )}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          {/* Editor */}
+          {selectedId !== null ? (
+            <>
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs uppercase text-muted">Name</label>
+                  <input
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    className="input mt-1 w-full"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs uppercase text-muted">Body (HTML allowed)</label>
+                  <textarea
+                    value={body}
+                    onChange={(e) => setBody(e.target.value)}
+                    rows={14}
+                    className="input mt-1 w-full font-mono text-xs"
+                  />
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={save} disabled={busy} className="btn-primary text-xs">
+                    {busy ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle2 size={12} />}
+                    Save
+                  </button>
+                  {templates.find((t) => t.id === selectedId)?.slug !== defaultSlug && (
+                    <button
+                      onClick={() => {
+                        const t = templates.find((x) => x.id === selectedId);
+                        if (t) setDefault(t.slug);
+                      }}
+                      disabled={busy}
+                      className="btn-secondary text-xs"
+                      title="Use this template for every publish"
+                    >
+                      Make default
+                    </button>
+                  )}
+                  {templates.find((t) => t.id === selectedId)?.slug !== "default" && (
+                    <button
+                      onClick={remove}
+                      disabled={busy}
+                      className="btn-danger text-xs"
+                      title="Delete this template"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Preview */}
+              <div>
+                <div className="flex items-center gap-2 text-xs uppercase text-muted">
+                  <Eye size={12} /> Preview (sample product)
+                </div>
+                <div
+                  className="prose prose-invert mt-1 max-h-[440px] overflow-y-auto rounded-lg border border-border bg-panel2 p-3 text-sm"
+                  // Render trusted HTML from the editor preview endpoint. The
+                  // variables are server-controlled (sample) so XSS surface
+                  // here is limited to what the user already typed.
+                  dangerouslySetInnerHTML={{ __html: preview }}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="lg:col-span-2 text-sm text-muted">Select a template to edit.</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TrackingSection() {
   const [s, setS] = useState<AppSettings | null>(null);
   const [apiKey, setApiKey] = useState("");
@@ -770,6 +1033,8 @@ export default function SettingsPage() {
       <AutoRepriceSection />
 
       <AmazonFulfillmentSection />
+
+      <DescriptionTemplatesSection />
 
       <TrackingSection />
 
