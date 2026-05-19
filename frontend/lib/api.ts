@@ -176,6 +176,9 @@ export type AppSettings = {
   min_reprice_change_percent: number;
   amazon_email: string;
   amazon_password_set: boolean;
+  // Phase 5.1c — AliExpress credentials (masked on read like Amazon's)
+  aliexpress_email: string;
+  aliexpress_password_set: boolean;
   auto_fulfill_enabled: boolean;
   fulfillment_headless: boolean;
   fulfillment_dry_run: boolean;
@@ -208,6 +211,7 @@ export type DescriptionTemplate = {
 // fields (e.g. plaintext secrets) that the GET response masks.
 export type AppSettingsPatch = Partial<AppSettings> & {
   amazon_password?: string;
+  aliexpress_password?: string;
   easypost_api_key?: string;
 };
 

@@ -865,6 +865,11 @@ DEFAULT_SETTINGS = {
     "min_reprice_change_percent": "1.0",
     "amazon_email": "",
     "amazon_password": "",
+    # Phase 5.1c — AliExpress credentials for the Playwright auto-checkout.
+    # Stored plaintext (same caveat as Amazon); use a dedicated AliExpress
+    # account, not your shopping account.
+    "aliexpress_email": "",
+    "aliexpress_password": "",
     "auto_fulfill_enabled": "false",
     "fulfillment_headless": "false",
     "fulfillment_dry_run": "true",
@@ -2656,6 +2661,9 @@ def api_get_settings():
         "amazon_email": s.get("amazon_email", ""),
         # Never return the password — only indicate whether one is set
         "amazon_password_set": bool(s.get("amazon_password", "").strip()),
+        # Phase 5.1c — AliExpress credentials (masked like Amazon's)
+        "aliexpress_email": s.get("aliexpress_email", ""),
+        "aliexpress_password_set": bool(s.get("aliexpress_password", "").strip()),
         "auto_fulfill_enabled": s.get("auto_fulfill_enabled", "false").lower() == "true",
         "fulfillment_headless": s.get("fulfillment_headless", "false").lower() == "true",
         "fulfillment_dry_run": s.get("fulfillment_dry_run", "true").lower() == "true",
@@ -2683,6 +2691,8 @@ class SettingsIn(BaseModel):
     min_reprice_change_percent: Optional[float] = None
     amazon_email: Optional[str] = None
     amazon_password: Optional[str] = None
+    aliexpress_email: Optional[str] = None
+    aliexpress_password: Optional[str] = None
     auto_fulfill_enabled: Optional[bool] = None
     fulfillment_headless: Optional[bool] = None
     fulfillment_dry_run: Optional[bool] = None
@@ -2715,6 +2725,16 @@ def api_update_settings(payload: SettingsIn):
             set_setting("amazon_password", "")
         else:
             set_setting("amazon_password", payload.amazon_password)
+    if payload.aliexpress_email is not None:
+        set_setting("aliexpress_email", payload.aliexpress_email.strip())
+    if payload.aliexpress_password is not None:
+        # Same set/clear semantics as the Amazon password
+        if payload.aliexpress_password == "":
+            pass
+        elif payload.aliexpress_password == "__CLEAR__":
+            set_setting("aliexpress_password", "")
+        else:
+            set_setting("aliexpress_password", payload.aliexpress_password)
     if payload.auto_fulfill_enabled is not None:
         set_setting("auto_fulfill_enabled", "true" if payload.auto_fulfill_enabled else "false")
     if payload.fulfillment_headless is not None:
@@ -4382,12 +4402,27 @@ class FulfillIn(BaseModel):
     headless: Optional[bool] = None
 
 
+def _is_aliexpress_product(product) -> bool:
+    """Phase 5.1c — detect AliExpress products so we dispatch to the right
+    Playwright module. Two signals (either is sufficient): the ASIN starts
+    with "ALI-" (our chosen prefix in Phase 5.1a) OR the source_marketplace
+    hostname contains 'aliexpress'.
+    """
+    asin = (product["asin"] or "") if "asin" in product.keys() else ""
+    src = (product["source_marketplace"] or "") if "source_marketplace" in product.keys() else ""
+    return asin.upper().startswith("ALI-") or "aliexpress" in src.lower()
+
+
 @app.post("/api/orders/{order_id}/fulfill")
 async def fulfill_order(order_id: str, body: FulfillIn = FulfillIn()):
-    from fulfillment import (
+    # Shared infrastructure (dataclasses + attempt-recording helpers) lives
+    # in backend.fulfillment; the supplier-specific drivers each export a
+    # `fulfill_on_*` async function with the same signature shape.
+    from backend.fulfillment import (
         BuyerAddress, FulfillRequest, fulfill_on_amazon,
         record_attempt_start, record_attempt_finish,
     )
+    from backend.fulfillment_aliexpress import fulfill_on_aliexpress
 
     with db() as conn:
         order = conn.execute(
@@ -4403,13 +4438,28 @@ async def fulfill_order(order_id: str, body: FulfillIn = FulfillIn()):
             "SELECT * FROM products WHERE asin = ?", (order["product_asin"],)
         ).fetchone()
     if not product or not product["amazon_url"]:
-        raise HTTPException(400, "product (or its amazon_url) is missing")
+        raise HTTPException(400, "product (or its source URL) is missing")
+
+    is_ali = _is_aliexpress_product(product)
+    supplier = "aliexpress" if is_ali else "amazon"
 
     cfg = get_settings_dict()
-    email = cfg.get("amazon_email", "").strip()
-    password = cfg.get("amazon_password", "").strip()
-    if not email or not password:
-        raise HTTPException(400, "Amazon credentials not configured (Settings → Amazon account)")
+    if is_ali:
+        email = cfg.get("aliexpress_email", "").strip()
+        password = cfg.get("aliexpress_password", "").strip()
+        if not email or not password:
+            raise HTTPException(
+                400,
+                "AliExpress credentials not configured (Settings → AliExpress account)",
+            )
+    else:
+        email = cfg.get("amazon_email", "").strip()
+        password = cfg.get("amazon_password", "").strip()
+        if not email or not password:
+            raise HTTPException(
+                400,
+                "Amazon credentials not configured (Settings → Amazon account)",
+            )
 
     dry_run = body.dry_run if body.dry_run is not None else cfg.get("fulfillment_dry_run", "true").lower() == "true"
     headless = body.headless if body.headless is not None else cfg.get("fulfillment_headless", "false").lower() == "true"
@@ -4434,10 +4484,16 @@ async def fulfill_order(order_id: str, body: FulfillIn = FulfillIn()):
     with db() as conn:
         attempt_id = record_attempt_start(conn, req)
 
-    result = await fulfill_on_amazon(
-        req=req, amazon_email=email, amazon_password=password,
-        headless=headless, dry_run=dry_run,
-    )
+    if is_ali:
+        result = await fulfill_on_aliexpress(
+            req=req, aliexpress_email=email, aliexpress_password=password,
+            headless=headless, dry_run=dry_run,
+        )
+    else:
+        result = await fulfill_on_amazon(
+            req=req, amazon_email=email, amazon_password=password,
+            headless=headless, dry_run=dry_run,
+        )
 
     with db() as conn:
         record_attempt_finish(conn, attempt_id, result)
@@ -4451,7 +4507,12 @@ async def fulfill_order(order_id: str, body: FulfillIn = FulfillIn()):
         "ok": result.status in ("success", "dry_run"),
         "attempt_id": attempt_id,
         "status": result.status,
-        "amazon_order_id": result.amazon_order_id,
+        "supplier": supplier,
+        # Generic "supplier order id" — the field is named `amazon_order_id`
+        # on the result + DB row for backwards compatibility, but it holds
+        # the AliExpress order id when supplier == 'aliexpress'.
+        "supplier_order_id": result.amazon_order_id,
+        "amazon_order_id": result.amazon_order_id,  # legacy alias
         "tracking_number": result.tracking_number,
         "carrier": result.carrier,
         "error": result.error,

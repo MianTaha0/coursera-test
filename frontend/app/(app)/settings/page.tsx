@@ -696,6 +696,108 @@ function AmazonFulfillmentSection() {
   );
 }
 
+function AliExpressFulfillmentSection() {
+  const [s, setS] = useState<AppSettings | null>(null);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    api<AppSettings>("/api/settings").then((s) => {
+      setS(s);
+      setEmail(s.aliexpress_email || "");
+    }).catch(() => {});
+  }, []);
+
+  async function patch(update: Record<string, unknown>) {
+    setBusy(true);
+    try {
+      const fresh = await api<AppSettings>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify(update),
+      });
+      setS(fresh);
+      if (fresh.aliexpress_email !== undefined) setEmail(fresh.aliexpress_email);
+      if ("aliexpress_password" in update) setPassword("");
+      setSavedAt(Date.now());
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-3">
+        <Store size={20} className="text-muted" />
+        <h2 className="text-lg font-semibold">Auto-fulfillment (AliExpress)</h2>
+        {busy && <Loader2 size={14} className="animate-spin text-muted" />}
+        {!busy && savedAt && Date.now() - savedAt < 3000 && (
+          <span className="text-xs text-accent">Saved</span>
+        )}
+      </div>
+
+      <div className="mt-3 flex items-start gap-2 rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+        <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+        <div>
+          Credentials are stored in plaintext in <code>droply.db</code>. Use a
+          dedicated AliExpress account (not your shopping account). The dry-run
+          and headless toggles in the Amazon section above apply here too.
+        </div>
+      </div>
+
+      {!s ? (
+        <div className="mt-4 text-sm text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <div>
+            <label className="text-xs uppercase text-muted">AliExpress email</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              onBlur={() => {
+                if (email !== s.aliexpress_email) patch({ aliexpress_email: email });
+              }}
+              placeholder="you@example.com"
+              className="input mt-1 w-full"
+            />
+          </div>
+          <div>
+            <label className="text-xs uppercase text-muted">
+              AliExpress password {s.aliexpress_password_set && <span className="text-accent">(set)</span>}
+            </label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={s.aliexpress_password_set ? "•••••••• (leave blank to keep)" : "Set password"}
+              className="input mt-1 w-full"
+            />
+            <div className="mt-1 flex gap-2">
+              <button
+                className="btn-secondary text-xs"
+                onClick={() => password && patch({ aliexpress_password: password })}
+                disabled={!password || busy}
+              >
+                Save password
+              </button>
+              {s.aliexpress_password_set && (
+                <button
+                  className="btn-danger text-xs"
+                  onClick={() => patch({ aliexpress_password: "__CLEAR__" })}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DescriptionTemplatesSection() {
   const [templates, setTemplates] = useState<DescriptionTemplate[] | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -1133,6 +1235,8 @@ export default function SettingsPage() {
       <AutoRepriceSection />
 
       <AmazonFulfillmentSection />
+
+      <AliExpressFulfillmentSection />
 
       <DescriptionTemplatesSection />
 

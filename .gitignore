@@ -32,8 +32,9 @@ Thumbs.db
 *.db-wal
 *.db-shm
 
-# Playwright runtime state (browser cookies + Amazon login session)
+# Playwright runtime state (browser cookies + supplier login sessions)
 backend/.pw_user_data/
+backend/.pw_user_data_aliexpress/
 backend/fulfillment_screenshots/
 
 # Misc local artifacts
