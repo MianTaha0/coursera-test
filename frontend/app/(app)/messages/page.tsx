@@ -9,8 +9,11 @@ import {
   Copy,
   CheckCircle2,
   Loader2,
+  Inbox,
+  RefreshCw,
+  Bot,
 } from "lucide-react";
-import { api, MessageTemplate } from "@/lib/api";
+import { api, InboundMessage, MessageTemplate, OutboundMessage } from "@/lib/api";
 
 const TEMPLATE_VARIABLES = [
   "buyer_name",
@@ -41,6 +44,63 @@ function fillTemplate(text: string, vars: Record<string, string>): string {
 }
 
 export default function MessagesPage() {
+  const [tab, setTab] = useState<"inbox" | "templates">("inbox");
+  const [unread, setUnread] = useState<number>(0);
+
+  // Poll the unread count so the tab badge stays current.
+  useEffect(() => {
+    let alive = true;
+    async function tick() {
+      try {
+        const rows = await api<InboundMessage[]>("/api/messages/inbound?needs_reply=true");
+        if (alive) setUnread(rows.length);
+      } catch {
+        /* ignore — backend may be down */
+      }
+    }
+    tick();
+    const t = setInterval(tick, 30_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Messages</h1>
+        <div className="flex rounded-lg border border-border bg-panel2 p-1">
+          <button
+            onClick={() => setTab("inbox")}
+            className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-sm ${
+              tab === "inbox" ? "bg-accent/15 text-accent" : "text-muted hover:text-white"
+            }`}
+          >
+            <Inbox size={14} /> Inbox
+            {unread > 0 && (
+              <span className="rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                {unread}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setTab("templates")}
+            className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-sm ${
+              tab === "templates" ? "bg-accent/15 text-accent" : "text-muted hover:text-white"
+            }`}
+          >
+            <MessageSquare size={14} /> Templates
+          </button>
+        </div>
+      </div>
+
+      {tab === "inbox" ? <InboxView onUnreadChange={setUnread} /> : <TemplatesView />}
+    </div>
+  );
+}
+
+function TemplatesView() {
   const [templates, setTemplates] = useState<MessageTemplate[] | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [draft, setDraft] = useState<Partial<MessageTemplate>>({});
@@ -151,13 +211,10 @@ export default function MessagesPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">Messages</h1>
-          <p className="text-sm text-muted">
-            Templates for buyer communication. Fill variables on the right to
-            preview, then copy into eBay's message center.
-          </p>
-        </div>
+        <p className="text-sm text-muted">
+          Templates for buyer communication. Fill variables on the right to
+          preview, then copy into eBay's message center.
+        </p>
         <button onClick={createNew} className="btn-primary" disabled={busy}>
           <Plus size={16} /> New template
         </button>
@@ -307,3 +364,305 @@ export default function MessagesPage() {
     </div>
   );
 }
+
+// ===========================================================================
+// Inbox (Phase 4.2) — threaded buyer ↔ seller conversations
+// ===========================================================================
+
+type Thread = {
+  key: string;                 // group key (order or buyer)
+  ebay_order_id: string | null;
+  sender_username: string;
+  ebay_item_id: string | null;
+  inbound: InboundMessage[];
+  outbound: OutboundMessage[];
+  needs_reply_count: number;
+  last_received_at: string;
+};
+
+function groupThreads(
+  inbound: InboundMessage[],
+  outbound: OutboundMessage[],
+): Thread[] {
+  const map = new Map<string, Thread>();
+  function keyFor(m: { ebay_order_id: string | null; sender_username?: string | null }) {
+    return m.ebay_order_id || `buyer:${m.sender_username || "unknown"}`;
+  }
+  for (const m of inbound) {
+    const key = keyFor(m);
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        ebay_order_id: m.ebay_order_id,
+        sender_username: m.sender_username || "(unknown buyer)",
+        ebay_item_id: m.ebay_item_id,
+        inbound: [],
+        outbound: [],
+        needs_reply_count: 0,
+        last_received_at: m.received_at,
+      });
+    }
+    const t = map.get(key)!;
+    t.inbound.push(m);
+    if (m.needs_reply) t.needs_reply_count++;
+    if (m.received_at > t.last_received_at) t.last_received_at = m.received_at;
+  }
+  for (const m of outbound) {
+    // outbound rows only have ebay_order_id, no sender — they belong to an
+    // order thread if one exists.
+    const key = m.ebay_order_id || "";
+    if (!key || !map.has(key)) continue;
+    map.get(key)!.outbound.push(m);
+  }
+  return Array.from(map.values()).sort((a, b) =>
+    b.last_received_at.localeCompare(a.last_received_at),
+  );
+}
+
+function InboxView({ onUnreadChange }: { onUnreadChange?: (n: number) => void }) {
+  const [inbound, setInbound] = useState<InboundMessage[] | null>(null);
+  const [outbound, setOutbound] = useState<OutboundMessage[]>([]);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    setError(null);
+    try {
+      const [inb, outb] = await Promise.all([
+        api<InboundMessage[]>("/api/messages/inbound?limit=500"),
+        api<OutboundMessage[]>("/api/messages/outbound?limit=500"),
+      ]);
+      setInbound(inb);
+      setOutbound(outb);
+      onUnreadChange?.(inb.filter((m) => m.needs_reply).length);
+    } catch (e: any) {
+      setError(e.message || "Failed to load");
+    }
+  }
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 30_000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const threads = useMemo(() => groupThreads(inbound || [], outbound), [inbound, outbound]);
+  const selected = threads.find((t) => t.key === selectedKey) || null;
+
+  async function pollNow() {
+    setBusy(true);
+    try {
+      await api("/api/messages/inbound/poll-now", { method: "POST" });
+      await load();
+    } catch (e: any) {
+      setError(e.message || "Poll failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function markReplied(id: number) {
+    setBusy(true);
+    try {
+      await api(`/api/messages/inbound/${id}/mark-replied`, { method: "POST" });
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function markRead(id: number) {
+    try {
+      await api(`/api/messages/inbound/${id}/mark-read`, { method: "POST" });
+      await load();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-muted">
+          Buyer messages pulled from eBay every 5 min. Click a thread to read,
+          then reply via the existing message-template flow.
+        </p>
+        <button onClick={pollNow} disabled={busy} className="btn-secondary text-xs">
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+          Poll now
+        </button>
+      </div>
+
+      {error && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+          {error}
+        </div>
+      )}
+
+      {inbound === null ? (
+        <div className="card text-muted">Loading…</div>
+      ) : threads.length === 0 ? (
+        <div className="card text-center text-muted">
+          No buyer messages yet. eBay will surface them here once buyers reach out.
+        </div>
+      ) : (
+        <div className="grid gap-4 lg:grid-cols-[320px,1fr]">
+          {/* Thread list */}
+          <div className="space-y-1 lg:max-h-[70vh] lg:overflow-y-auto">
+            {threads.map((t) => (
+              <button
+                key={t.key}
+                onClick={() => {
+                  setSelectedKey(t.key);
+                  // mark every unread message in this thread as read
+                  for (const m of t.inbound) {
+                    if (!m.read_at) markRead(m.id);
+                  }
+                }}
+                className={`block w-full rounded-lg border p-3 text-left ${
+                  selectedKey === t.key
+                    ? "border-accent/40 bg-accent/5"
+                    : "border-border bg-panel2 hover:border-accent/20"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="truncate font-medium">{t.sender_username}</div>
+                  {t.needs_reply_count > 0 && (
+                    <span className="rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                      {t.needs_reply_count}
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1 text-xs text-muted">
+                  {t.ebay_order_id ? (
+                    <span className="font-mono">Order {t.ebay_order_id}</span>
+                  ) : (
+                    <span>No order link</span>
+                  )}
+                </div>
+                <div className="mt-1 truncate text-xs text-white/70">
+                  {t.inbound[t.inbound.length - 1]?.subject || "(no subject)"}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          {/* Thread view */}
+          {selected ? (
+            <ThreadView thread={selected} onMarkReplied={markReplied} />
+          ) : (
+            <div className="card text-center text-muted">Select a thread to read.</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ThreadView({
+  thread,
+  onMarkReplied,
+}: {
+  thread: Thread;
+  onMarkReplied: (id: number) => void;
+}) {
+  // Interleave inbound and outbound by timestamp.
+  const items = useMemo(() => {
+    type Item =
+      | { type: "in"; at: string; msg: InboundMessage }
+      | { type: "out"; at: string; msg: OutboundMessage };
+    const arr: Item[] = [
+      ...thread.inbound.map((m): Item => ({ type: "in", at: m.received_at, msg: m })),
+      ...thread.outbound.map((m): Item => ({ type: "out", at: m.sent_at || m.created_at, msg: m })),
+    ];
+    return arr.sort((a, b) => a.at.localeCompare(b.at));
+  }, [thread]);
+
+  return (
+    <div className="card space-y-3">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border pb-3">
+        <div className="text-sm">
+          <span className="font-semibold">{thread.sender_username}</span>
+          {thread.ebay_order_id && (
+            <span className="ml-2 font-mono text-xs text-muted">Order {thread.ebay_order_id}</span>
+          )}
+        </div>
+        <a
+          href="https://www.ebay.com/mesg/"
+          target="_blank"
+          rel="noopener"
+          className="btn-secondary ml-auto text-xs"
+        >
+          Reply on eBay
+        </a>
+      </div>
+
+      <div className="space-y-3">
+        {items.map((it, i) =>
+          it.type === "in" ? (
+            <div key={`in-${it.msg.id}`} className="rounded-lg border border-border bg-panel2 p-3">
+              <div className="flex items-center gap-2 text-xs text-muted">
+                <Inbox size={12} className="text-blue-300" />
+                <b className="text-white/90">{it.msg.sender_username}</b>
+                <span>· {new Date(it.msg.received_at).toLocaleString()}</span>
+                {it.msg.auto_replied ? (
+                  <span className="ml-auto inline-flex items-center gap-1 text-accent">
+                    <Bot size={11} /> auto-replied
+                  </span>
+                ) : it.msg.needs_reply ? (
+                  <button
+                    onClick={() => onMarkReplied(it.msg.id)}
+                    className="ml-auto btn-secondary text-[10px] py-0.5 px-2"
+                    title="Hide the 'needs reply' badge"
+                  >
+                    Mark replied
+                  </button>
+                ) : null}
+              </div>
+              {it.msg.subject && (
+                <div className="mt-1 text-sm font-medium">{it.msg.subject}</div>
+              )}
+              <div className="mt-1 whitespace-pre-wrap text-sm text-white/90">
+                {it.msg.body || "(no body)"}
+              </div>
+            </div>
+          ) : (
+            <div
+              key={`out-${it.msg.id}`}
+              className="ml-8 rounded-lg border border-accent/20 bg-accent/5 p-3"
+            >
+              <div className="flex items-center gap-2 text-xs text-muted">
+                <MessageSquare size={12} className="text-accent" />
+                <b className="text-accent">You (Droply)</b>
+                <span>· {new Date(it.at).toLocaleString()}</span>
+                <span
+                  className={`ml-auto badge ${
+                    it.msg.status === "sent"
+                      ? "bg-accent/15 text-accent"
+                      : it.msg.status === "failed"
+                      ? "bg-red-500/15 text-red-300"
+                      : "bg-yellow-500/15 text-yellow-300"
+                  }`}
+                >
+                  {it.msg.status}
+                </span>
+              </div>
+              {it.msg.subject && (
+                <div className="mt-1 text-sm font-medium">{it.msg.subject}</div>
+              )}
+              <div className="mt-1 whitespace-pre-wrap text-sm text-white/90">
+                {it.msg.body}
+              </div>
+              {it.msg.error && (
+                <div className="mt-1 text-xs text-red-300">⚠ {it.msg.error}</div>
+              )}
+            </div>
+          ),
+        )}
+      </div>
+    </div>
+  );
+}
+
