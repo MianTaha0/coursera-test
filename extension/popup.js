@@ -66,9 +66,21 @@ function render(state) {
   }
 }
 
+function renderRetry(queue) {
+  const banner = $("retry-banner");
+  const count = $("retry-count");
+  if (!banner || !count) return;
+  if (queue && queue.length) {
+    banner.style.display = "block";
+    count.textContent = String(queue.length);
+  } else {
+    banner.style.display = "none";
+  }
+}
+
 function load() {
   chrome.storage.local.get(
-    ["droply_imports", "droply_today", "droply_backend_url"],
+    ["droply_imports", "droply_today", "droply_backend_url", "droply_retry_queue"],
     (res) => {
       const today = new Date().toISOString().slice(0, 10);
       const counter = res.droply_today && res.droply_today.date === today
@@ -78,6 +90,7 @@ function load() {
         imports: Array.isArray(res.droply_imports) ? res.droply_imports : [],
         today: counter.count,
       });
+      renderRetry(Array.isArray(res.droply_retry_queue) ? res.droply_retry_queue : []);
       $("backend-url").value = res.droply_backend_url || "";
       $("backend-url").placeholder = DEFAULT_BACKEND;
     },
@@ -144,6 +157,32 @@ document.addEventListener("DOMContentLoaded", () => {
   load();
   $("clear-btn").addEventListener("click", clearAll);
   $("export-btn").addEventListener("click", copyJson);
+
+  // Retry-queue manual flush
+  $("retry-flush-btn").addEventListener("click", () => {
+    const btn = $("retry-flush-btn");
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "Retrying…";
+    chrome.runtime.sendMessage({ type: "DROPLY_RETRY_FLUSH" }, (res) => {
+      btn.disabled = false;
+      btn.textContent = orig;
+      load();
+      if (!chrome.runtime.lastError && res?.ok && res.drained > 0) {
+        // brief visual confirmation
+        btn.textContent = `Pushed ${res.drained}`;
+        setTimeout(() => { btn.textContent = orig; }, 1500);
+      }
+    });
+  });
+
+  // Keep the banner fresh while the popup is open (storage events fire when
+  // the content script enqueues from the background or another tab).
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.droply_retry_queue) {
+      renderRetry(changes.droply_retry_queue.newValue || []);
+    }
+  });
 
   // Recheck-all button
   $("recheck-now-btn").addEventListener("click", () => {

@@ -84,6 +84,13 @@
         </div>
       </div>
 
+      <div id="retry-banner" style="display: none; margin-bottom: 8px; padding: 8px 10px; background: #2a1f0a; border: 1px solid #6b4516; border-radius: 8px; color: #fbbf24; font-size: 12px;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+          <span><span id="retry-count">0</span> pending sync(s)</span>
+          <button id="retry-flush-btn" class="btn btn-secondary" style="flex: 0 0 auto; padding: 4px 10px; font-size: 11px;">Retry now</button>
+        </div>
+      </div>
+
       <div class="list-head">
         <div class="muted">Recent imports</div>
         <button id="export-btn" class="remove" title="Copy all as JSON">Copy JSON</button>

@@ -3,9 +3,15 @@
   "name": "Droply — Save Amazon products",
   "version": "1.0.0",
   "description": "One-click capture of Amazon product data. Self-contained — saves to your browser, no account needed.",
-  "permissions": ["activeTab", "storage", "scripting", "tabs", "alarms"],
+  "permissions": ["activeTab", "storage", "scripting", "tabs", "alarms", "notifications"],
   "background": {
     "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
   },
   "host_permissions": [
     "https://www.amazon.com/*",
@@ -17,7 +23,13 @@
   ],
   "action": {
     "default_title": "Droply",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   },
   "web_accessible_resources": [
     {

@@ -5,6 +5,8 @@
   const MAX_STORED = 200;
   const BACKEND_URL_KEY = "droply_backend_url";
   const DEFAULT_BACKEND = "http://localhost:8000";
+  const RETRY_QUEUE_KEY = "droply_retry_queue";
+  const MAX_RETRY_QUEUE = 100;
 
   // ---------- DOM helpers ----------
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -12,14 +14,25 @@
   const text = (el) => (el ? el.textContent.replace(/\s+/g, " ").trim() : "");
 
   // ---------- Scraper ----------
+  // ASIN format: 10 alphanumeric chars. Old regex was upper-case-only; loosened
+  // to allow lower-case in URL paths (some redirects normalise to lowercase)
+  // and a `/product/` variant that shows up on some locales.
   function extractAsin() {
-    const m = location.pathname.match(/(?:\/dp\/|\/gp\/product\/)([A-Z0-9]{10})/i);
+    const m = location.pathname.match(/(?:\/dp\/|\/gp\/product\/|\/product\/)([A-Z0-9]{10})\b/i);
     if (m) return m[1].toUpperCase();
     const meta =
       $('input#ASIN') ||
       $('input[name="ASIN"]') ||
       $('div[data-asin]:not([data-asin=""])');
-    if (meta) return (meta.value || meta.getAttribute("data-asin") || "").toUpperCase();
+    if (meta) {
+      const raw = (meta.value || meta.getAttribute("data-asin") || "").toUpperCase();
+      // Anchor against a canonical 10-char token so partial DOM noise doesn't slip through.
+      const mm = raw.match(/\b[A-Z0-9]{10}\b/);
+      if (mm) return mm[0];
+    }
+    // Last resort: look in the URL query (some review pages route through ?asin=…)
+    const qs = new URLSearchParams(location.search).get("asin");
+    if (qs && /^[A-Z0-9]{10}$/i.test(qs)) return qs.toUpperCase();
     return null;
   }
   function extractTitle() {
@@ -198,9 +211,29 @@
     }
   }
 
+  // Retry queue — products whose backend POST failed get appended here so the
+  // background service worker (or the next save) can flush them in order.
+  async function enqueueRetry(item) {
+    return new Promise((resolve) => {
+      chrome.storage.local.get([RETRY_QUEUE_KEY], (res) => {
+        const queue = Array.isArray(res[RETRY_QUEUE_KEY]) ? res[RETRY_QUEUE_KEY] : [];
+        // Replace any earlier copy of the same ASIN — only keep the latest snapshot.
+        const filtered = queue.filter((q) => q.asin !== item.asin);
+        filtered.push(item);
+        const trimmed = filtered.slice(-MAX_RETRY_QUEUE);
+        chrome.storage.local.set({ [RETRY_QUEUE_KEY]: trimmed }, () => resolve(trimmed.length));
+      });
+    });
+  }
+
   async function saveImport(item) {
     const total = await saveLocal(item);
     const push = await pushToBackend(item);
+    if (!push.ok) {
+      try { await enqueueRetry(item); } catch (_) { /* swallow */ }
+      // Tell the background worker to schedule a flush.
+      try { chrome.runtime.sendMessage({ type: "DROPLY_RETRY_NUDGE" }); } catch (_) { /* swallow */ }
+    }
     return { total, push };
   }
 

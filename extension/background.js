@@ -7,6 +7,11 @@
 // We close the tab as soon as the content script confirms it's done.
 
 const ALARM_NAME = "droply-recheck-all";
+const RETRY_ALARM_NAME = "droply-retry-flush";
+const RETRY_QUEUE_KEY = "droply_retry_queue";
+const BACKEND_URL_KEY = "droply_backend_url";
+const DEFAULT_BACKEND = "http://localhost:8000";
+const RETRY_FLUSH_INTERVAL_MIN = 10;
 const RECHECK_INTERVAL_KEY = "droply_recheck_interval_min"; // user-configurable
 const DEFAULT_INTERVAL_MIN = 360; // 6 hours
 const TAB_TIMEOUT_MS = 25_000;     // safety: never let a recheck tab linger
@@ -21,6 +26,11 @@ async function setupAlarm() {
     delayInMinutes: minutes,
     periodInMinutes: minutes,
   });
+  // Retry-queue flush — fires on a fast cadence so backend recovery is quick.
+  chrome.alarms.create(RETRY_ALARM_NAME, {
+    delayInMinutes: 1,
+    periodInMinutes: RETRY_FLUSH_INTERVAL_MIN,
+  });
 }
 
 chrome.runtime.onInstalled.addListener(setupAlarm);
@@ -28,6 +38,7 @@ chrome.runtime.onStartup.addListener(setupAlarm);
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_NAME) await recheckAll({ source: "alarm" });
+  if (alarm.name === RETRY_ALARM_NAME) await flushRetryQueue("alarm");
 });
 
 // ---------- Message channel from popup ----------
@@ -52,7 +63,76 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     });
     return true;
   }
+  if (msg?.type === "DROPLY_RETRY_NUDGE") {
+    // Content script saw a failed POST and queued it; surface a toast and try
+    // to flush soon. We don't await here — the channel is fire-and-forget.
+    notifyBackendDown();
+    flushRetryQueue("nudge").catch((e) => console.warn("retry flush failed", e));
+  }
+  if (msg?.type === "DROPLY_RETRY_FLUSH") {
+    flushRetryQueue("manual").then(
+      (result) => sendResponse({ ok: true, ...result }),
+      (err) => sendResponse({ ok: false, error: String(err) }),
+    );
+    return true;
+  }
 });
+
+// ---------- Retry queue ----------
+async function getBackendUrl() {
+  const { [BACKEND_URL_KEY]: u } = await chrome.storage.local.get([BACKEND_URL_KEY]);
+  return u || DEFAULT_BACKEND;
+}
+
+let notifyDownRecentMs = 0;
+async function notifyBackendDown() {
+  // Throttle — only one toast every 60s.
+  if (Date.now() - notifyDownRecentMs < 60_000) return;
+  notifyDownRecentMs = Date.now();
+  try {
+    await chrome.notifications.create("droply-backend-down", {
+      type: "basic",
+      iconUrl: "icons/icon-128.png",
+      title: "Droply — backend unreachable",
+      message: "Saved locally. We'll retry the sync automatically when the backend comes back.",
+    });
+  } catch (_) { /* notifications may be disabled */ }
+}
+
+async function flushRetryQueue(source) {
+  const { [RETRY_QUEUE_KEY]: queue = [] } = await chrome.storage.local.get([RETRY_QUEUE_KEY]);
+  if (!queue.length) return { source, drained: 0, remaining: 0 };
+  const url = await getBackendUrl();
+  if (!url) return { source, drained: 0, remaining: queue.length };
+
+  const remaining = [];
+  let drained = 0;
+  for (const item of queue) {
+    try {
+      const r = await fetch(`${url}/api/products`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item),
+      });
+      if (r.ok) drained++;
+      else remaining.push(item);
+    } catch (_) {
+      remaining.push(item);
+    }
+  }
+  await chrome.storage.local.set({ [RETRY_QUEUE_KEY]: remaining });
+  if (drained > 0) {
+    try {
+      await chrome.notifications.create(`droply-drained-${Date.now()}`, {
+        type: "basic",
+        iconUrl: "icons/icon-128.png",
+        title: "Droply — sync caught up",
+        message: `Pushed ${drained} pending product${drained === 1 ? "" : "s"} to the backend.`,
+      });
+    } catch (_) { /* swallow */ }
+  }
+  return { source, drained, remaining: remaining.length };
+}
 
 // ---------- Recheck driver ----------
 async function recheckAll({ source }) {
@@ -88,32 +168,45 @@ function sleep(ms) {
 
 async function rescanInBackgroundTab(url) {
   return new Promise((resolve, reject) => {
-    chrome.tabs.create({ url, active: false }, (tab) => {
-      if (chrome.runtime.lastError || !tab?.id) {
-        return reject(chrome.runtime.lastError || new Error("no tab"));
-      }
-      const tabId = tab.id;
-      let done = false;
-      const finish = (ok, err) => {
-        if (done) return;
-        done = true;
-        chrome.tabs.onUpdated.removeListener(updateListener);
-        chrome.tabs.remove(tabId).catch(() => {});
-        clearTimeout(timer);
-        ok ? resolve() : reject(err);
-      };
-      const updateListener = (id, changeInfo) => {
-        if (id !== tabId) return;
-        if (changeInfo.status === "complete") {
-          // Give the content script ~6s to scrape + push to backend
-          setTimeout(() => finish(true), 6_000);
+    // Open the recheck page in a brand-new minimized window so it stays out
+    // of the user's tab strip and never steals focus.
+    chrome.windows.create(
+      { url, focused: false, state: "minimized", type: "normal" },
+      (win) => {
+        if (chrome.runtime.lastError || !win || !win.tabs?.[0]?.id) {
+          return reject(chrome.runtime.lastError || new Error("no window"));
         }
-      };
-      chrome.tabs.onUpdated.addListener(updateListener);
-      const timer = setTimeout(
-        () => finish(false, new Error("recheck tab timeout")),
-        TAB_TIMEOUT_MS,
-      );
-    });
+        const tabId = win.tabs[0].id;
+        const winId = win.id;
+        let done = false;
+        const finish = (ok, err) => {
+          if (done) return;
+          done = true;
+          chrome.tabs.onUpdated.removeListener(updateListener);
+          // Closing the only tab in the window auto-closes the window too.
+          if (winId !== undefined) {
+            chrome.windows.remove(winId).catch(() => {
+              chrome.tabs.remove(tabId).catch(() => {});
+            });
+          } else {
+            chrome.tabs.remove(tabId).catch(() => {});
+          }
+          clearTimeout(timer);
+          ok ? resolve() : reject(err);
+        };
+        const updateListener = (id, changeInfo) => {
+          if (id !== tabId) return;
+          if (changeInfo.status === "complete") {
+            // Give the content script ~6s to scrape + push to backend
+            setTimeout(() => finish(true), 6_000);
+          }
+        };
+        chrome.tabs.onUpdated.addListener(updateListener);
+        const timer = setTimeout(
+          () => finish(false, new Error("recheck tab timeout")),
+          TAB_TIMEOUT_MS,
+        );
+      },
+    );
   });
 }
