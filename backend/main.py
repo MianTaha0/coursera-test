@@ -249,6 +249,9 @@ def init_db() -> None:
             # Phase 3.1 — eBay dispatch deadline (computed at order persist time)
             if "dispatch_deadline" not in cols:
                 conn.execute("ALTER TABLE orders ADD COLUMN dispatch_deadline TEXT")
+            # Phase 3.4 — when status flipped to "delivered" (used to time auto-feedback)
+            if "delivered_at" not in cols:
+                conn.execute("ALTER TABLE orders ADD COLUMN delivered_at TEXT")
 
         # Migrate the old orders schema (auto-incrementing id) → new ebay_order_id PK
         cur = conn.execute("PRAGMA table_info(orders)").fetchall()
@@ -353,7 +356,8 @@ def init_db() -> None:
                 tracking_checked_at TEXT,
                 created_at TEXT,
                 synced_at TEXT,
-                dispatch_deadline TEXT
+                dispatch_deadline TEXT,
+                delivered_at TEXT
             )
         """)
         # Active eBay listings (one row per ASIN/marketplace pair)
@@ -896,6 +900,10 @@ DEFAULT_SETTINGS = {
     "dispatch_deadline_business_days": "2",
     # Phase 3.1 — flag an order as "urgent" this many hours before its deadline.
     "dispatch_deadline_urgent_hours": "6",
+    # Phase 3.4 — number of days after delivery before queueing the
+    # feedback_request template. eBay's own feedback request prompt fires at
+    # ~5 days; sending earlier feels pushy.
+    "feedback_request_delay_days": "7",
     # Description template used at publish time. Empty string = use raw
     # product description (the Amazon bullets).
     "default_description_template_slug": "default",
@@ -2692,6 +2700,8 @@ def api_get_settings():
         # Phase 3.1 — dispatch deadline + urgency window
         "dispatch_deadline_business_days": float(s.get("dispatch_deadline_business_days", "2")),
         "dispatch_deadline_urgent_hours": float(s.get("dispatch_deadline_urgent_hours", "6")),
+        # Phase 3.4 — auto-feedback delay
+        "feedback_request_delay_days": float(s.get("feedback_request_delay_days", "7")),
         # Phase 2.3: which description template to render at publish time.
         # Empty string = skip the template and use the raw Amazon description.
         "default_description_template_slug": s.get("default_description_template_slug", "default"),
@@ -2721,6 +2731,7 @@ class SettingsIn(BaseModel):
     scheduler_enabled: Optional[bool] = None
     dispatch_deadline_business_days: Optional[float] = None
     dispatch_deadline_urgent_hours: Optional[float] = None
+    feedback_request_delay_days: Optional[float] = None
     default_description_template_slug: Optional[str] = None
     margin_rules: Optional[list[dict[str, Any]]] = None
 
@@ -2783,6 +2794,8 @@ def api_update_settings(payload: SettingsIn):
         set_setting("dispatch_deadline_business_days", str(payload.dispatch_deadline_business_days))
     if payload.dispatch_deadline_urgent_hours is not None:
         set_setting("dispatch_deadline_urgent_hours", str(payload.dispatch_deadline_urgent_hours))
+    if payload.feedback_request_delay_days is not None:
+        set_setting("feedback_request_delay_days", str(payload.feedback_request_delay_days))
     if payload.default_description_template_slug is not None:
         set_setting("default_description_template_slug", payload.default_description_template_slug)
     if payload.margin_rules is not None:
@@ -3106,12 +3119,25 @@ async def refresh_tracking_for_order(order_id: str) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
 
     with db() as conn:
-        conn.execute(
-            """UPDATE orders SET tracking_status = ?, tracking_status_text = ?,
-                                  tracking_checked_at = ?
-               WHERE ebay_order_id = ?""",
-            (new_status, status_text, now, order_id),
-        )
+        # Phase 3.4 — first time we see status=delivered, stamp delivered_at
+        # so the auto-feedback scheduler has a timestamp to wait from. The
+        # COALESCE keeps the original delivery moment when status flips back
+        # and forth on a re-poll.
+        if new_status == "delivered":
+            conn.execute(
+                """UPDATE orders SET tracking_status = ?, tracking_status_text = ?,
+                                      tracking_checked_at = ?,
+                                      delivered_at = COALESCE(delivered_at, ?)
+                   WHERE ebay_order_id = ?""",
+                (new_status, status_text, now, now, order_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE orders SET tracking_status = ?, tracking_status_text = ?,
+                                      tracking_checked_at = ?
+                   WHERE ebay_order_id = ?""",
+                (new_status, status_text, now, order_id),
+            )
 
     if new_status == "delivered" and order["tracking_status"] != "delivered":
         queue_buyer_message(
@@ -3593,6 +3619,59 @@ async def poll_inbound_for_all_accounts(*, lookback_days: int = 7) -> dict[str, 
     return {"ok": True, "accounts": len(rows), "details": out}
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.4 — Auto-feedback request
+# Queues the `feedback_request` message template N days after each order's
+# delivery. Idempotent on (ebay_order_id, trigger_event) — see queue_buyer_message.
+# ---------------------------------------------------------------------------
+
+def queue_overdue_feedback_requests() -> dict[str, Any]:
+    """Find delivered orders past the configured delay and queue the
+    feedback_request template. Returns a summary.
+
+    Conditions on the order:
+      * delivered_at IS NOT NULL
+      * delivered_at <= NOW - feedback_request_delay_days
+      * no outbound_messages row exists with trigger_event='feedback_followup'
+    """
+    cfg = get_settings_dict()
+    try:
+        delay_days = float(cfg.get("feedback_request_delay_days") or 7)
+    except (TypeError, ValueError):
+        delay_days = 7.0
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=delay_days)).isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT o.ebay_order_id
+                 FROM orders o
+                WHERE o.delivered_at IS NOT NULL
+                  AND o.delivered_at <= ?
+                  AND NOT EXISTS (
+                        SELECT 1 FROM outbound_messages m
+                         WHERE m.ebay_order_id = o.ebay_order_id
+                           AND m.trigger_event = 'feedback_followup'
+                  )
+               LIMIT 200""",
+            (cutoff,),
+        ).fetchall()
+
+    queued = 0
+    for r in rows:
+        try:
+            mid = queue_buyer_message(
+                ebay_order_id=r["ebay_order_id"],
+                trigger_event="feedback_followup",
+                template_slug="feedback_request",
+            )
+            if mid:
+                queued += 1
+        except Exception:  # noqa: BLE001 — never break the scheduler loop
+            continue
+    return {"ok": True, "considered": len(rows), "queued": queued,
+            "delay_days": delay_days}
+
+
 def _slugify(s: str) -> str:
     out = "".join(c if c.isalnum() else "_" for c in s.strip().lower())
     return "_".join(filter(None, out.split("_")))[:60] or "template"
@@ -3980,7 +4059,7 @@ def api_scheduler_status():
 @app.post("/api/scheduler/run-now/{job_id}")
 async def api_scheduler_run_now(job_id: str):
     """Fire a specific scheduler job immediately (useful for sandbox testing)."""
-    valid = {"message_flush", "order_sync", "tracking_refresh", "inbox_poll"}
+    valid = {"message_flush", "order_sync", "tracking_refresh", "inbox_poll", "feedback_followup"}
     if job_id not in valid:
         raise HTTPException(400, f"unknown job '{job_id}'. expected one of {sorted(valid)}")
     if job_id == "message_flush":
@@ -3991,6 +4070,8 @@ async def api_scheduler_run_now(job_id: str):
         return await refresh_all_tracking()
     if job_id == "inbox_poll":
         return await poll_inbound_for_all_accounts(lookback_days=7)
+    if job_id == "feedback_followup":
+        return queue_overdue_feedback_requests()
     raise HTTPException(500, "unreachable")
 
 
@@ -4485,9 +4566,10 @@ def mark_order_delivered(order_id: str):
         conn.execute(
             """UPDATE orders SET tracking_status = 'delivered',
                                   tracking_status_text = 'Marked as delivered manually',
-                                  tracking_checked_at = ?
+                                  tracking_checked_at = ?,
+                                  delivered_at = COALESCE(delivered_at, ?)
                WHERE ebay_order_id = ?""",
-            (now, order_id),
+            (now, now, order_id),
         )
     if not was_delivered:
         queue_buyer_message(

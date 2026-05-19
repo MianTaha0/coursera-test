@@ -93,6 +93,19 @@ async def _job_inbox_poll() -> None:
         logger.warning("inbox_poll failed: %s", e)
 
 
+async def _job_feedback_followup() -> None:
+    """Phase 3.4 — queue feedback_request templates N days post-delivery."""
+    if not _enabled():
+        return
+    from backend.main import queue_overdue_feedback_requests
+    try:
+        result = queue_overdue_feedback_requests()
+        _record("feedback_followup", result, None)
+    except Exception as e:  # noqa: BLE001
+        _record("feedback_followup", None, str(e)[:300])
+        logger.warning("feedback_followup failed: %s", e)
+
+
 def start() -> None:
     """Idempotent: safe to call multiple times (replaces existing jobs)."""
     global _scheduler
@@ -119,10 +132,15 @@ def start() -> None:
         id="tracking_refresh", replace_existing=True, max_instances=1,
         coalesce=True,
     )
+    _scheduler.add_job(
+        _job_feedback_followup, IntervalTrigger(hours=6),
+        id="feedback_followup", replace_existing=True, max_instances=1,
+        coalesce=True,
+    )
 
     if not _scheduler.running:
         _scheduler.start()
-    logger.info("Droply scheduler started (4 jobs).")
+    logger.info("Droply scheduler started (5 jobs).")
 
 
 def shutdown() -> None:
