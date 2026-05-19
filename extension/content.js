@@ -148,6 +148,37 @@
     if (byline) return byline.replace(/^visit the |^brand:\s*/i, "").replace(/ store$/i, "");
     return "";
   }
+  // Spec table — drives eBay item-specifics (aspects) auto-fill on the backend.
+  // Amazon exposes specs in two layouts depending on category:
+  //   1. #productDetails_techSpec_section_1 / _section_2 — two-column tables
+  //      with <th>label</th><td>value</td>
+  //   2. #detailBullets_feature_div ul.detail-bullet-list — bullet list where
+  //      each <li> contains <span><span>label</span><span>value</span></span>
+  function extractSpecTable() {
+    const out = {};
+    // Layout 1: tech-spec tables
+    $$('table[id^="productDetails_"] tr').forEach((tr) => {
+      const k = text(tr.querySelector("th"));
+      const v = text(tr.querySelector("td"));
+      if (k && v && !out[k]) out[k] = v;
+    });
+    // Layout 2: detail bullet list
+    $$('#detailBullets_feature_div li, #detailBulletsWrapper_feature_div li').forEach((li) => {
+      const spans = li.querySelectorAll("span > span");
+      if (spans.length >= 2) {
+        const k = text(spans[0]).replace(/[:\s]+$/, "");
+        const v = text(spans[1]);
+        if (k && v && !out[k]) out[k] = v;
+      }
+    });
+    // Strip noisy keys
+    for (const k of Object.keys(out)) {
+      if (/customer reviews|best sellers rank|date first available/i.test(k)) {
+        delete out[k];
+      }
+    }
+    return out;
+  }
   function scrape() {
     const asin = extractAsin();
     if (!asin) return null;
@@ -161,6 +192,7 @@
       description: extractDescription(),
       stock_status: extractStock(),
       brand: extractBrand(),
+      spec_table: extractSpecTable(),
       amazon_url: `${location.origin}/dp/${asin}`,
       source_marketplace: location.hostname,
       saved_at: new Date().toISOString(),

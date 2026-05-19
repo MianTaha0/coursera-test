@@ -237,7 +237,9 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE outbound_messages ADD COLUMN last_attempt_at TEXT")
 
         # Additive migration for products: store the resolved eBay category so
-        # we don't re-call the Taxonomy API on every publish.
+        # we don't re-call the Taxonomy API on every publish, plus item
+        # specifics (Phase 2.2): aspects, scraped Amazon spec table, and a
+        # flag the UI uses to surface "needs attention" rows.
         cur = conn.execute("PRAGMA table_info(products)").fetchall()
         if cur:
             pcols = {c["name"] for c in cur}
@@ -245,6 +247,12 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE products ADD COLUMN ebay_category_id TEXT")
             if "ebay_category_name" not in pcols:
                 conn.execute("ALTER TABLE products ADD COLUMN ebay_category_name TEXT")
+            if "ebay_aspects" not in pcols:
+                conn.execute("ALTER TABLE products ADD COLUMN ebay_aspects TEXT")
+            if "spec_table" not in pcols:
+                conn.execute("ALTER TABLE products ADD COLUMN spec_table TEXT")
+            if "aspects_needs_attention" not in pcols:
+                conn.execute("ALTER TABLE products ADD COLUMN aspects_needs_attention INTEGER NOT NULL DEFAULT 0")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
@@ -260,7 +268,10 @@ def init_db() -> None:
                 source_marketplace TEXT,
                 saved_at TEXT,
                 ebay_category_id TEXT,
-                ebay_category_name TEXT
+                ebay_category_name TEXT,
+                ebay_aspects TEXT,
+                spec_table TEXT,
+                aspects_needs_attention INTEGER NOT NULL DEFAULT 0
             )
         """)
         conn.execute("""
@@ -445,6 +456,18 @@ def init_db() -> None:
             )
         """)
 
+        # eBay Taxonomy API: aspect-schema cache per (marketplace, category).
+        # The taxonomy moves slowly, so we re-fetch at most once per 30 days.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS category_aspects_cache (
+                marketplace_id TEXT NOT NULL,
+                category_id TEXT NOT NULL,
+                aspects_json TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (marketplace_id, category_id)
+            )
+        """)
+
         # eBay seller accounts ("stores"). One row per connected eBay account.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ebay_accounts (
@@ -542,6 +565,14 @@ def row_to_product(r: sqlite3.Row) -> dict[str, Any]:
         d["images"] = json.loads(d.get("images") or "[]")
     except Exception:
         d["images"] = []
+    for jcol in ("ebay_aspects", "spec_table"):
+        if jcol in d and d.get(jcol):
+            try:
+                d[jcol] = json.loads(d[jcol])
+            except Exception:
+                d[jcol] = {}
+        elif jcol in d:
+            d[jcol] = {}
     return d
 
 
@@ -922,6 +953,157 @@ async def get_category_suggestions(
     return out
 
 
+async def get_item_aspects_for_category(
+    *, token: str, marketplace_id: str, category_id: str,
+) -> list[dict[str, Any]]:
+    """Return the aspect schema for a category.
+
+    Each entry: {name, required, mode (FREE_TEXT|SELECTION_ONLY), cardinality
+    (SINGLE|MULTI), values: [...], aspect_data_type}. Cached for 30 days per
+    (marketplace, category) in `category_aspects_cache`.
+    """
+    if not category_id:
+        return []
+    tree_id = _category_tree_id(marketplace_id)
+
+    with db() as conn:
+        cached = conn.execute(
+            "SELECT aspects_json, fetched_at FROM category_aspects_cache "
+            "WHERE marketplace_id = ? AND category_id = ?",
+            (marketplace_id, category_id),
+        ).fetchone()
+    if cached:
+        try:
+            age_days = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(cached["fetched_at"])
+            ).days
+        except (TypeError, ValueError):
+            age_days = 999
+        if age_days < 30:
+            try:
+                return json.loads(cached["aspects_json"]) or []
+            except (TypeError, ValueError):
+                pass
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "X-EBAY-C-MARKETPLACE-ID": marketplace_id,
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{EBAY_API_BASE}/commerce/taxonomy/v1/category_tree/{tree_id}/get_item_aspects_for_category",
+            headers=headers, params={"category_id": category_id},
+        )
+    if r.status_code != 200:
+        raise HTTPException(502, f"eBay aspects fetch failed: {r.text[:300]}")
+
+    aspects = (r.json() or {}).get("aspects") or []
+    out = []
+    for a in aspects:
+        cons = a.get("aspectConstraint") or {}
+        vals = a.get("aspectValues") or []
+        out.append({
+            "name": a.get("localizedAspectName"),
+            "required": bool(cons.get("aspectRequired")),
+            "mode": cons.get("aspectMode") or "FREE_TEXT",
+            "cardinality": cons.get("itemToAspectCardinality") or "SINGLE",
+            "aspect_data_type": cons.get("aspectDataType") or "STRING",
+            "values": [v.get("localizedValue") for v in vals if v.get("localizedValue")],
+        })
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO category_aspects_cache
+                 (marketplace_id, category_id, aspects_json, fetched_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(marketplace_id, category_id) DO UPDATE SET
+                 aspects_json = excluded.aspects_json,
+                 fetched_at   = excluded.fetched_at""",
+            (marketplace_id, category_id, json.dumps(out), now_iso),
+        )
+    return out
+
+
+def _autofill_aspects(
+    *, product: dict[str, Any], schema: list[dict[str, Any]],
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Auto-fill aspects from product data using the rules below.
+
+    Returns (aspects, missing_required) where `aspects` maps name → list of
+    string values (eBay's required shape) and `missing_required` is the list
+    of required aspect names we couldn't fill.
+
+    Rules per aspect (case-insensitive name match):
+      - Brand / Marca / Marque  → product.brand
+      - MPN / Model             → product.asin
+      - Type / Subtype          → 'Generic' fallback
+      - Anything else           → search title + description + spec_table values
+    """
+    title = (product.get("title") or "").strip()
+    brand = (product.get("brand") or "").strip()
+    asin  = (product.get("asin") or "").strip()
+    desc  = (product.get("description") or "").strip()
+    spec  = product.get("spec_table") or {}
+    user_overrides = product.get("ebay_aspects") or {}
+
+    # Normalise spec_table keys for searching
+    spec_lower = {(k or "").strip().lower(): str(v) for k, v in spec.items()} if isinstance(spec, dict) else {}
+
+    # Cheap haystack for FREE_TEXT searches
+    haystack = f"{title}\n{desc}\n{' '.join(spec_lower.values())}".lower()
+
+    aspects: dict[str, list[str]] = {}
+    missing: list[str] = []
+
+    BRAND_NAMES = {"brand", "marca", "marque", "marke"}
+    MPN_NAMES   = {"mpn", "manufacturer part number", "model"}
+    TYPE_NAMES  = {"type", "subtype", "style"}
+
+    for a in schema:
+        name = (a.get("name") or "").strip()
+        if not name:
+            continue
+        # User override always wins
+        override = user_overrides.get(name)
+        if override is not None and str(override).strip():
+            val = override if isinstance(override, list) else [str(override)]
+            aspects[name] = [str(v) for v in val if str(v).strip()]
+            continue
+
+        lower = name.lower()
+        value: Optional[str] = None
+
+        if lower in BRAND_NAMES and brand:
+            value = brand
+        elif lower in MPN_NAMES and asin:
+            value = asin
+        elif lower in TYPE_NAMES:
+            value = "Generic"
+
+        # Try the spec table by case-insensitive key match
+        if value is None and lower in spec_lower:
+            v = spec_lower[lower].strip()
+            if v:
+                value = v[:80]
+
+        # For SELECTION_ONLY aspects, try to find one of the listed values in the haystack
+        if value is None and a.get("mode") == "SELECTION_ONLY":
+            for opt in (a.get("values") or []):
+                if opt and opt.lower() in haystack:
+                    value = opt
+                    break
+
+        if value:
+            aspects[name] = [value]
+        elif a.get("required"):
+            missing.append(name)
+
+    return aspects, missing
+
+
 async def ensure_business_policies(headers: dict, marketplace_id: str) -> dict:
     """Ensure default fulfillment/payment/return policies exist; return their IDs."""
     policy_headers = {**headers}
@@ -1050,6 +1232,9 @@ class ProductIn(BaseModel):
     description: str = ""
     stock_status: str = "in_stock"
     amazon_url: str = ""
+    # Optional Amazon spec table scraped by the extension. Key-value strings,
+    # used by the backend at publish time to auto-fill eBay item specifics.
+    spec_table: Optional[dict[str, str]] = None
     source_marketplace: str = ""
     saved_at: Optional[str] = None
 
@@ -1064,6 +1249,7 @@ class ListEbayIn(BaseModel):
     payment_policy_id: Optional[str] = None
     return_policy_id: Optional[str] = None
     override_vero: bool = False            # bypass VeRO blocklist (use carefully)
+    override_aspects: bool = False         # publish even if required item-specifics are missing
 
 
 # ---------------------------------------------------------------------------
@@ -1315,6 +1501,7 @@ class ListEbayBulkIn(BaseModel):
     category_id: Optional[str] = None        # If None, each product auto-detects (or uses its stored override)
     marketplace_id: str = "EBAY_US"
     override_vero: bool = False
+    override_aspects: bool = False
 
 
 @app.post("/api/products/list-ebay-bulk")
@@ -1332,6 +1519,7 @@ async def list_on_ebay_bulk(body: ListEbayBulkIn):
                 category_id=body.category_id,
                 marketplace_id=body.marketplace_id,
                 override_vero=body.override_vero,
+                override_aspects=body.override_aspects,
             ))
             results.append({"asin": asin, "ok": True, **r})
         except HTTPException as e:
@@ -1414,6 +1602,35 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
                 (category_id, category_name, asin),
             )
 
+    # --- Build item specifics (aspects) from product data + the category schema ---
+    aspect_schema = await get_item_aspects_for_category(
+        token=token, marketplace_id=body.marketplace_id, category_id=category_id,
+    )
+    auto_aspects, missing_required = _autofill_aspects(product=product, schema=aspect_schema)
+
+    if missing_required and not body.override_aspects:
+        # Flag the product so the UI can surface a "needs attention" badge.
+        with db() as conn:
+            conn.execute(
+                "UPDATE products SET aspects_needs_attention = 1 WHERE asin = ?",
+                (asin,),
+            )
+        raise HTTPException(
+            422,
+            {"error": "aspects_missing",
+             "message": "Required item specifics are missing for this category.",
+             "missing": missing_required,
+             "category_id": category_id,
+             "category_name": category_name},
+        )
+
+    # Clear the needs-attention flag once we have everything.
+    with db() as conn:
+        conn.execute(
+            "UPDATE products SET aspects_needs_attention = 0 WHERE asin = ?",
+            (asin,),
+        )
+
     # Step 0 — ensure a merchant location exists (eBay needs Item.Country)
     async with httpx.AsyncClient() as client:
         r_loc_check = await client.get(
@@ -1446,6 +1663,10 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
     # Step 1 — create/update inventory item
     brand = product.get("brand") or "Unbranded"
     mpn = (product.get("asin") or "N/A")
+    # Ensure Brand / MPN are always present even if the category schema didn't
+    # list them — eBay requires both at the product level for most categories.
+    final_aspects: dict[str, list[str]] = {"Brand": [brand], "MPN": [mpn]}
+    final_aspects.update(auto_aspects)
     item_payload: dict[str, Any] = {
         "product": {
             "title": title,
@@ -1453,12 +1674,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
             "imageUrls": images[:12],
             "brand": brand,
             "mpn": mpn,
-            "aspects": {
-                "Brand": [brand],
-                "MPN": [mpn],
-                "Model": [mpn],
-                "Type": ["Generic"],
-            },
+            "aspects": final_aspects,
         },
         "condition": "NEW",
         "availability": {
@@ -1575,6 +1791,13 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         markup_percent=markup_pct,
     )
 
+    # Persist the aspects we actually published so the UI reflects ground truth.
+    with db() as conn:
+        conn.execute(
+            "UPDATE products SET ebay_aspects = ? WHERE asin = ?",
+            (json.dumps(final_aspects), asin),
+        )
+
     return {
         "ok": True,
         "sku": sku,
@@ -1584,6 +1807,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         "listing_price": listing_price,
         "category_id": category_id,
         "category_name": category_name,
+        "aspects": final_aspects,
     }
 
 
@@ -1595,6 +1819,10 @@ class CategoryOverrideIn(BaseModel):
     category_id: str
     category_name: Optional[str] = None
     marketplace_id: str = "EBAY_US"
+
+
+class AspectsOverrideIn(BaseModel):
+    aspects: dict[str, list[str]]
 
 
 @app.post("/api/products/{asin}/suggest-category")
@@ -1634,6 +1862,73 @@ def api_set_category(asin: str, payload: CategoryOverrideIn):
     return {"ok": True}
 
 
+@app.put("/api/products/{asin}/aspects")
+def api_set_aspects(asin: str, payload: AspectsOverrideIn):
+    """Manually set item-specifics for a product (overrides auto-fill).
+
+    Clears the `aspects_needs_attention` flag in case the user filled the gaps.
+    """
+    with db() as conn:
+        existing = conn.execute("SELECT 1 FROM products WHERE asin = ?", (asin,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Product not found")
+        conn.execute(
+            """UPDATE products
+                  SET ebay_aspects = ?,
+                      aspects_needs_attention = 0
+                WHERE asin = ?""",
+            (json.dumps(payload.aspects), asin),
+        )
+    return {"ok": True, "aspects": payload.aspects}
+
+
+@app.get("/api/products/{asin}/aspect-schema")
+async def api_aspect_schema(asin: str, marketplace_id: str = "EBAY_US"):
+    """Return the aspect schema + auto-filled values for a product.
+
+    Drives the "Edit category & aspects" modal. If the product has no category
+    set, runs detection first.
+    """
+    with db() as conn:
+        row = conn.execute("SELECT * FROM products WHERE asin = ?", (asin,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Product not found")
+    product = row_to_product(row)
+
+    token = await get_valid_token()
+    category_id = product.get("ebay_category_id")
+    category_name = product.get("ebay_category_name")
+    if not category_id:
+        suggestions = await get_category_suggestions(
+            token=token, marketplace_id=marketplace_id, query=product.get("title", ""),
+        )
+        if suggestions:
+            top = suggestions[0]
+            category_id = top["category_id"]
+            category_name = top.get("category_name")
+            with db() as conn:
+                conn.execute(
+                    "UPDATE products SET ebay_category_id = ?, ebay_category_name = ? WHERE asin = ?",
+                    (category_id, category_name, asin),
+                )
+
+    if not category_id:
+        return {"category_id": None, "schema": [], "auto": {}, "missing": []}
+
+    schema = await get_item_aspects_for_category(
+        token=token, marketplace_id=marketplace_id, category_id=category_id,
+    )
+    auto, missing = _autofill_aspects(product=product, schema=schema)
+    return {
+        "category_id": category_id,
+        "category_name": category_name,
+        "schema": schema,
+        "auto": auto,
+        "missing": missing,
+        "user_overrides": product.get("ebay_aspects") or {},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes — products (unchanged)
 # ---------------------------------------------------------------------------
@@ -1654,11 +1949,13 @@ def _upsert(conn: sqlite3.Connection, p: ProductIn) -> dict[str, Any]:
             (p.asin, p.price, p.currency, p.stock_status, saved_at),
         )
 
+    spec_json = json.dumps(p.spec_table) if p.spec_table else None
     conn.execute(
         """
         INSERT INTO products (asin, title, brand, price, currency, images, description,
-                              stock_status, amazon_url, source_marketplace, saved_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                              stock_status, amazon_url, source_marketplace, saved_at,
+                              spec_table)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(asin) DO UPDATE SET
             title=excluded.title,
             brand=excluded.brand,
@@ -1669,12 +1966,13 @@ def _upsert(conn: sqlite3.Connection, p: ProductIn) -> dict[str, Any]:
             stock_status=excluded.stock_status,
             amazon_url=excluded.amazon_url,
             source_marketplace=excluded.source_marketplace,
-            saved_at=excluded.saved_at
+            saved_at=excluded.saved_at,
+            spec_table=COALESCE(excluded.spec_table, products.spec_table)
         """,
         (
             p.asin, p.title, p.brand, p.price, p.currency,
             json.dumps(p.images), p.description, p.stock_status,
-            p.amazon_url, p.source_marketplace, saved_at,
+            p.amazon_url, p.source_marketplace, saved_at, spec_json,
         ),
     )
     row = conn.execute("SELECT * FROM products WHERE asin = ?", (p.asin,)).fetchone()

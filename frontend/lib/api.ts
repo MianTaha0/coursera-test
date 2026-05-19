@@ -37,9 +37,30 @@ export type Product = {
   amazon_url: string;
   source_marketplace: string;
   saved_at: string;
-  // eBay category resolved by the Taxonomy API (Phase 2.1)
+  // eBay category + item-specifics (Phase 2.1 / 2.2)
   ebay_category_id?: string | null;
   ebay_category_name?: string | null;
+  ebay_aspects?: Record<string, string[]> | null;
+  spec_table?: Record<string, string> | null;
+  aspects_needs_attention?: number;
+};
+
+export type EbayAspect = {
+  name: string;
+  required: boolean;
+  mode: "FREE_TEXT" | "SELECTION_ONLY";
+  cardinality: "SINGLE" | "MULTI";
+  aspect_data_type: string;
+  values: string[];
+};
+
+export type AspectSchema = {
+  category_id: string | null;
+  category_name?: string | null;
+  schema: EbayAspect[];
+  auto: Record<string, string[]>;
+  missing: string[];
+  user_overrides: Record<string, string[]>;
 };
 
 export type CategorySuggestion = {

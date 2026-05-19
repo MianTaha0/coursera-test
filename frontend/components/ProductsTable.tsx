@@ -1,11 +1,12 @@
 "use client";
 
-import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon, ShieldAlert } from "lucide-react";
+import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon, ShieldAlert, Layers, AlertTriangle } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, AppSettings, EbayListing, Product, VeroMatch, computeNet } from "@/lib/api";
 import { money, date } from "@/lib/format";
 import PriceHistoryModal from "./PriceHistoryModal";
 import TitleOptimizerModal from "./TitleOptimizerModal";
+import CategoryAspectsModal from "./CategoryAspectsModal";
 
 const DEFAULT_MARKUP_PERCENT = 30;
 
@@ -43,6 +44,7 @@ export default function ProductsTable({
   const [historyProduct, setHistoryProduct] = useState<Product | null>(null);
   const [titleProduct, setTitleProduct] = useState<Product | null>(null);
   const [titleOverrideVero, setTitleOverrideVero] = useState(false);
+  const [aspectsProduct, setAspectsProduct] = useState<Product | null>(null);
   // ASIN → listing record (persisted server-side)
   const [listings, setListings] = useState<Record<string, EbayListing>>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -131,7 +133,18 @@ export default function ProductsTable({
       setTitleProduct(null);
       window.open(result.listing_url, "_blank", "noopener");
     } catch (e: any) {
-      flash(e.message || "eBay listing failed.", "err");
+      // Auto-open the category/aspects modal when the backend complains about
+      // missing item specifics or category. The user fills them in, hits save,
+      // and re-clicks Publish.
+      const msg = String(e.message || "");
+      if (msg.includes("aspects_missing") || msg.includes("Required item specifics") ||
+          msg.includes("no_category_suggestion") || msg.includes("category suggestions")) {
+        setTitleProduct(null);
+        setAspectsProduct(p);
+        flash("Fill in the required item specifics, then publish again.", "err");
+      } else {
+        flash(e.message || "eBay listing failed.", "err");
+      }
     } finally {
       setBusy(null);
     }
@@ -418,6 +431,21 @@ export default function ProductsTable({
                         </button>
                       )}
                       <button
+                        onClick={() => setAspectsProduct(p)}
+                        className={`btn-secondary text-xs ${p.aspects_needs_attention ? "border-yellow-500/50 text-yellow-300" : ""}`}
+                        title={
+                          p.aspects_needs_attention
+                            ? "Required item specifics missing — click to fix"
+                            : "Edit eBay category & item specifics"
+                        }
+                      >
+                        {p.aspects_needs_attention ? (
+                          <AlertTriangle size={14} />
+                        ) : (
+                          <Layers size={14} />
+                        )}
+                      </button>
+                      <button
                         onClick={() => setHistoryProduct(p)}
                         className="btn-secondary text-xs"
                         title="Price history"
@@ -479,6 +507,17 @@ export default function ProductsTable({
           onPublish={(customTitle) =>
             listOnEbayApi(titleProduct, customTitle, titleOverrideVero)
           }
+        />
+      )}
+
+      {aspectsProduct && (
+        <CategoryAspectsModal
+          product={aspectsProduct}
+          onClose={() => setAspectsProduct(null)}
+          onSaved={() => {
+            // Re-fetching products is the caller's job; tell them via onChange.
+            onChange?.();
+          }}
         />
       )}
     </>
