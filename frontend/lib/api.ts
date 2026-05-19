@@ -141,6 +141,15 @@ export type AppSettings = {
   ebay_per_order_fee: number;
   ebay_ad_rate_percent: number;
   amazon_shipping_cost: number;
+  easypost_api_key_set: boolean;
+  easypost_cache_ttl_minutes: number;
+};
+
+// Partial settings payload accepted by PUT /api/settings. Includes write-only
+// fields (e.g. plaintext secrets) that the GET response masks.
+export type AppSettingsPatch = Partial<AppSettings> & {
+  amazon_password?: string;
+  easypost_api_key?: string;
 };
 
 /**

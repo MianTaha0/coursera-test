@@ -398,7 +398,7 @@ export default function OrdersPage() {
                                 onClick={() => refreshTracking(o)}
                                 disabled={trackingBusy === o.ebay_order_id}
                                 className="btn-secondary text-xs"
-                                title="Re-check status (no carrier API configured yet — see backend/main.py)"
+                                title="Re-check carrier status (uses EasyPost — configure key in Settings)"
                               >
                                 {trackingBusy === o.ebay_order_id ? (
                                   <Loader2 size={12} className="animate-spin" />

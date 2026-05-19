@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle, RefreshCw, Calculator } from "lucide-react";
+import { Chrome, Server, CheckCircle2, XCircle, Download, Store, LogOut, Loader2, AlertTriangle, RefreshCw, Calculator, Truck } from "lucide-react";
 import { api, API_URL, AppSettings, computeNet } from "@/lib/api";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
@@ -596,6 +596,115 @@ function AmazonFulfillmentSection() {
   );
 }
 
+function TrackingSection() {
+  const [s, setS] = useState<AppSettings | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [ttl, setTtl] = useState<number>(60);
+  const [busy, setBusy] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    api<AppSettings>("/api/settings").then((s) => {
+      setS(s);
+      setTtl(s.easypost_cache_ttl_minutes ?? 60);
+    }).catch(() => {});
+  }, []);
+
+  async function patch(update: Record<string, unknown>) {
+    setBusy(true);
+    try {
+      const fresh = await api<AppSettings>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify(update),
+      });
+      setS(fresh);
+      setTtl(fresh.easypost_cache_ttl_minutes ?? 60);
+      if ("easypost_api_key" in update) setApiKey("");
+      setSavedAt(Date.now());
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="flex items-center gap-3">
+        <Truck size={20} className="text-muted" />
+        <h2 className="text-lg font-semibold">Carrier tracking (EasyPost)</h2>
+        {busy && <Loader2 size={14} className="animate-spin text-muted" />}
+        {!busy && savedAt && Date.now() - savedAt < 3000 && (
+          <span className="text-xs text-accent">Saved</span>
+        )}
+      </div>
+      <p className="mt-2 text-sm text-muted">
+        Connect an EasyPost API key to fetch live status for USPS, UPS, FedEx,
+        DHL and 100+ other carriers. Without a key the dashboard falls back to
+        manual <i>mark delivered</i>. Get a key at{" "}
+        <a className="text-accent hover:underline" href="https://www.easypost.com/account/api-keys" target="_blank" rel="noreferrer">
+          easypost.com/account/api-keys
+        </a>.
+      </p>
+
+      {!s ? (
+        <div className="mt-4 text-sm text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <div>
+            <label className="text-xs uppercase text-muted">
+              EasyPost API key {s.easypost_api_key_set && <span className="text-accent">(set)</span>}
+            </label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={s.easypost_api_key_set ? "•••••••• (leave blank to keep)" : "EZAK… or EZTK…"}
+              className="input mt-1 w-full"
+            />
+            <div className="mt-1 flex gap-2">
+              <button
+                className="btn-secondary text-xs"
+                onClick={() => apiKey && patch({ easypost_api_key: apiKey })}
+                disabled={!apiKey || busy}
+              >
+                Save key
+              </button>
+              {s.easypost_api_key_set && (
+                <button
+                  className="btn-danger text-xs"
+                  onClick={() => patch({ easypost_api_key: "__CLEAR__" })}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <label className="text-xs uppercase text-muted">Re-poll interval (minutes)</label>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={ttl}
+              onChange={(e) => setTtl(Number(e.target.value) || 60)}
+              onBlur={() => {
+                if (ttl !== s.easypost_cache_ttl_minutes) {
+                  patch({ easypost_cache_ttl_minutes: ttl });
+                }
+              }}
+              className="input mt-1 w-full"
+            />
+            <p className="mt-1 text-xs text-muted">
+              EasyPost is billed per tracker. We cache results per (carrier,
+              number) and re-poll at most this often.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const [apiOk, setApiOk] = useState<boolean | null>(null);
   const [stats, setStats] = useState<{ total: number; saved_today: number } | null>(null);
@@ -661,6 +770,8 @@ export default function SettingsPage() {
       <AutoRepriceSection />
 
       <AmazonFulfillmentSection />
+
+      <TrackingSection />
 
       {/* Chrome extension */}
       <div className="card">

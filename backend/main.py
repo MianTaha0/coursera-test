@@ -386,6 +386,21 @@ def init_db() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_history_asin ON price_history(asin, checked_at DESC)")
 
+        # EasyPost tracker cache. Avoids re-billing on every refresh tick — we
+        # only re-poll if `checked_at` is older than `easypost_cache_ttl_minutes`.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracking_cache (
+                carrier TEXT NOT NULL,
+                tracking_number TEXT NOT NULL,
+                easypost_tracker_id TEXT,
+                status TEXT NOT NULL,
+                status_text TEXT,
+                checked_at TEXT NOT NULL,
+                raw_json TEXT,
+                PRIMARY KEY (carrier, tracking_number)
+            )
+        """)
+
         # eBay seller accounts ("stores"). One row per connected eBay account.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ebay_accounts (
@@ -588,6 +603,9 @@ DEFAULT_SETTINGS = {
     "ebay_per_order_fee": "0.30",      # Fixed per-order fee
     "ebay_ad_rate_percent": "0",       # Promoted Listings ad rate %
     "amazon_shipping_cost": "0",       # Default extra cost added to Amazon price
+    # Carrier tracking (EasyPost)
+    "easypost_api_key": "",
+    "easypost_cache_ttl_minutes": "60",  # Re-poll EasyPost at most this often per (carrier, number)
 }
 
 
@@ -1574,6 +1592,9 @@ def api_get_settings():
         "ebay_per_order_fee": float(s.get("ebay_per_order_fee", "0.30")),
         "ebay_ad_rate_percent": float(s.get("ebay_ad_rate_percent", "0")),
         "amazon_shipping_cost": float(s.get("amazon_shipping_cost", "0")),
+        # EasyPost — never return the raw key; only indicate whether it's set
+        "easypost_api_key_set": bool(s.get("easypost_api_key", "").strip()),
+        "easypost_cache_ttl_minutes": float(s.get("easypost_cache_ttl_minutes", "60")),
     }
 
 
@@ -1590,6 +1611,8 @@ class SettingsIn(BaseModel):
     ebay_per_order_fee: Optional[float] = None
     ebay_ad_rate_percent: Optional[float] = None
     amazon_shipping_cost: Optional[float] = None
+    easypost_api_key: Optional[str] = None
+    easypost_cache_ttl_minutes: Optional[float] = None
 
 
 @app.put("/api/settings")
@@ -1624,6 +1647,16 @@ def api_update_settings(payload: SettingsIn):
         set_setting("ebay_ad_rate_percent", str(payload.ebay_ad_rate_percent))
     if payload.amazon_shipping_cost is not None:
         set_setting("amazon_shipping_cost", str(payload.amazon_shipping_cost))
+    if payload.easypost_api_key is not None:
+        # Empty string = leave unchanged; "__CLEAR__" sentinel = wipe it
+        if payload.easypost_api_key == "":
+            pass
+        elif payload.easypost_api_key == "__CLEAR__":
+            set_setting("easypost_api_key", "")
+        else:
+            set_setting("easypost_api_key", payload.easypost_api_key.strip())
+    if payload.easypost_cache_ttl_minutes is not None:
+        set_setting("easypost_cache_ttl_minutes", str(payload.easypost_cache_ttl_minutes))
     return api_get_settings()
 
 
@@ -1672,19 +1705,44 @@ def _order_to_template_vars(order: sqlite3.Row) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Tracking-status checker
 #
-# Real carrier APIs (USPS Web Tools, UPS, FedEx, DHL) all require credentials
-# we don't have. EasyPost / AfterShip aggregate them but also need keys. So
-# this is a deliberately-simple plug point: today it returns "unknown" for
-# every lookup, which means the operator must mark orders as delivered
-# manually. To wire in a real provider, replace `_lookup_status_remote()`
-# below — the rest of the pipeline (refresh endpoint, delivered template
-# trigger, status persistence) already works.
+# Uses EasyPost as the multi-carrier aggregator (USPS / UPS / FedEx / DHL /
+# 100+ others). API key is stored in app_settings.easypost_api_key.
+#
+# Status mapping: EasyPost returns one of
+#   pre_transit | in_transit | out_for_delivery | delivered |
+#   available_for_pickup | return_to_sender | failure | cancelled | error | unknown
+# We normalise into our canonical set: in_transit | out_for_delivery |
+#   delivered | exception | returned | unknown
 # ---------------------------------------------------------------------------
 CARRIER_TRACKING_URLS = {
     "USPS": "https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1={}",
     "UPS":  "https://www.ups.com/track?tracknum={}",
     "FEDEX": "https://www.fedex.com/fedextrack/?tracknumbers={}",
     "DHL":  "https://www.dhl.com/global-en/home/tracking/tracking-parcel.html?submit=1&tracking-id={}",
+}
+
+# EasyPost expects the carrier as one of its canonical slugs.
+EASYPOST_CARRIER_MAP = {
+    "USPS": "USPS",
+    "UPS": "UPS",
+    "FEDEX": "FedEx",
+    "DHL": "DHLExpress",
+    "DHLE": "DHLExpress",
+    "DHLEXPRESS": "DHLExpress",
+    "DHLECOMMERCE": "DHLeCommerce",
+}
+
+EASYPOST_STATUS_MAP = {
+    "pre_transit":           "in_transit",
+    "in_transit":            "in_transit",
+    "out_for_delivery":      "out_for_delivery",
+    "delivered":             "delivered",
+    "available_for_pickup":  "out_for_delivery",
+    "return_to_sender":      "returned",
+    "failure":               "exception",
+    "cancelled":             "exception",
+    "error":                 "exception",
+    "unknown":               "unknown",
 }
 
 
@@ -1695,13 +1753,98 @@ def carrier_tracking_url(carrier: Optional[str], number: Optional[str]) -> Optio
     return template.format(number) if template else None
 
 
-async def _lookup_status_remote(carrier: str, number: str) -> tuple[str, str]:
-    """Plug an external tracking API in here. Returns (status, status_text).
+def _normalize_easypost_carrier(carrier: str) -> str:
+    return EASYPOST_CARRIER_MAP.get((carrier or "").upper().replace(" ", ""), carrier)
 
-    Recognised statuses: in_transit | out_for_delivery | delivered |
-                         exception | returned | unknown
+
+async def _lookup_status_remote(carrier: str, number: str) -> tuple[str, str]:
+    """Fetch tracking status from EasyPost, with a per-(carrier, number) cache.
+
+    Returns (status, status_text). Statuses: in_transit | out_for_delivery |
+    delivered | exception | returned | unknown.
     """
-    return ("unknown", "Tracking API not configured.")
+    cfg = get_settings_dict()
+    api_key = (cfg.get("easypost_api_key") or "").strip()
+    if not api_key:
+        return ("unknown", "Tracking API not configured (set EasyPost API key in settings).")
+    if not carrier or not number:
+        return ("unknown", "Missing carrier or tracking number.")
+
+    try:
+        ttl_min = float(cfg.get("easypost_cache_ttl_minutes", "60") or 60)
+    except (TypeError, ValueError):
+        ttl_min = 60.0
+    cache_key = (carrier.upper(), number.strip())
+
+    # Cache hit — return early if fresh
+    with db() as conn:
+        cached = conn.execute(
+            "SELECT status, status_text, checked_at FROM tracking_cache "
+            "WHERE carrier = ? AND tracking_number = ?",
+            (cache_key[0], cache_key[1]),
+        ).fetchone()
+    if cached:
+        try:
+            checked = datetime.fromisoformat(cached["checked_at"])
+            age = (datetime.now(timezone.utc) - checked).total_seconds() / 60.0
+            if age < ttl_min:
+                return (cached["status"], cached["status_text"] or "")
+        except (TypeError, ValueError):
+            pass
+
+    ep_carrier = _normalize_easypost_carrier(carrier)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                "https://api.easypost.com/v2/trackers",
+                auth=(api_key, ""),
+                json={"tracker": {"tracking_code": number.strip(), "carrier": ep_carrier}},
+            )
+    except httpx.HTTPError as e:
+        return ("unknown", f"EasyPost request failed: {e}")
+
+    if r.status_code >= 400:
+        # EasyPost returns 422 for already-tracked codes — retry as GET on the
+        # existing tracker by tracking_code.
+        try:
+            err = r.json().get("error", {}).get("message", r.text)
+        except (ValueError, AttributeError):
+            err = r.text
+        return ("unknown", f"EasyPost {r.status_code}: {err}"[:300])
+
+    data = r.json()
+    ep_status = (data.get("status") or "unknown").lower()
+    status = EASYPOST_STATUS_MAP.get(ep_status, "unknown")
+    details = data.get("tracking_details") or []
+    detail_msg = ""
+    if details:
+        last = details[-1]
+        detail_msg = (last.get("message") or last.get("status_detail") or "")[:200]
+    status_text = detail_msg or ep_status.replace("_", " ").title()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO tracking_cache
+                 (carrier, tracking_number, easypost_tracker_id, status, status_text, checked_at, raw_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(carrier, tracking_number) DO UPDATE SET
+                 easypost_tracker_id = excluded.easypost_tracker_id,
+                 status = excluded.status,
+                 status_text = excluded.status_text,
+                 checked_at = excluded.checked_at,
+                 raw_json = excluded.raw_json""",
+            (
+                cache_key[0],
+                cache_key[1],
+                data.get("id"),
+                status,
+                status_text,
+                now_iso,
+                json.dumps(data)[:50000],
+            ),
+        )
+    return (status, status_text)
 
 
 async def refresh_tracking_for_order(order_id: str) -> dict[str, Any]:
