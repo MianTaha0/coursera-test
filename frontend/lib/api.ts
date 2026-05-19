@@ -43,6 +43,16 @@ export type Product = {
   ebay_aspects?: Record<string, string[]> | null;
   spec_table?: Record<string, string> | null;
   aspects_needs_attention?: number;
+  // Manual marketplace override (Phase 2.5). When null, the backend infers
+  // from source_marketplace (amazon.de → EBAY_DE, etc.).
+  preferred_marketplace_id?: string | null;
+};
+
+export type EbayMarketplace = {
+  marketplace_id: string;
+  language: string;
+  country: string | null;
+  default_city: string | null;
 };
 
 export type EbayAspect = {

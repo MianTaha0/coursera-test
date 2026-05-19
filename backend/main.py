@@ -269,6 +269,8 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE products ADD COLUMN spec_table TEXT")
             if "aspects_needs_attention" not in pcols:
                 conn.execute("ALTER TABLE products ADD COLUMN aspects_needs_attention INTEGER NOT NULL DEFAULT 0")
+            if "preferred_marketplace_id" not in pcols:
+                conn.execute("ALTER TABLE products ADD COLUMN preferred_marketplace_id TEXT")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
@@ -287,7 +289,8 @@ def init_db() -> None:
                 ebay_category_name TEXT,
                 ebay_aspects TEXT,
                 spec_table TEXT,
-                aspects_needs_attention INTEGER NOT NULL DEFAULT 0
+                aspects_needs_attention INTEGER NOT NULL DEFAULT 0,
+                preferred_marketplace_id TEXT
             )
         """)
         conn.execute("""
@@ -987,6 +990,106 @@ def _category_tree_id(marketplace_id: str) -> str:
     return EBAY_CATEGORY_TREE_IDS.get(marketplace_id, "0")
 
 
+# Marketplace-id → BCP-47 content language. eBay rejects requests where the
+# Content-Language header doesn't match the marketplace's expected locale.
+EBAY_MARKETPLACE_LANG = {
+    "EBAY_US": "en-US",
+    "EBAY_GB": "en-GB",
+    "EBAY_AU": "en-AU",
+    "EBAY_CA": "en-CA",
+    "EBAY_DE": "de-DE",
+    "EBAY_FR": "fr-FR",
+    "EBAY_IT": "it-IT",
+    "EBAY_ES": "es-ES",
+    "EBAY_AT": "de-AT",
+    "EBAY_BE": "nl-BE",
+    "EBAY_CH": "de-CH",
+    "EBAY_IE": "en-IE",
+    "EBAY_NL": "nl-NL",
+    "EBAY_PL": "pl-PL",
+    "EBAY_SG": "en-SG",
+    "EBAY_HK": "zh-HK",
+}
+
+
+def _content_language(marketplace_id: str) -> str:
+    return EBAY_MARKETPLACE_LANG.get(marketplace_id, "en-US")
+
+
+# Marketplace-id → ({country, postal_code, state, city, address}). eBay
+# requires the merchant location's country to match the marketplace's country
+# (i.e. you can't list on EBAY_GB from a US warehouse). These are sensible
+# defaults so a fresh install works on every supported marketplace; users
+# should override per-account in Phase 9 (`merchant_location` on ebay_accounts).
+EBAY_MARKETPLACE_LOCATION = {
+    "EBAY_US": {"country": "US", "postalCode": "94103", "stateOrProvince": "CA", "city": "San Francisco", "addressLine1": "1 Market St"},
+    "EBAY_GB": {"country": "GB", "postalCode": "EC1A 1BB", "stateOrProvince": "England", "city": "London", "addressLine1": "1 Cheapside"},
+    "EBAY_AU": {"country": "AU", "postalCode": "2000", "stateOrProvince": "NSW", "city": "Sydney", "addressLine1": "1 George St"},
+    "EBAY_CA": {"country": "CA", "postalCode": "M5H 2N2", "stateOrProvince": "Ontario", "city": "Toronto", "addressLine1": "1 King St W"},
+    "EBAY_DE": {"country": "DE", "postalCode": "10115", "stateOrProvince": "Berlin", "city": "Berlin", "addressLine1": "Friedrichstraße 1"},
+    "EBAY_FR": {"country": "FR", "postalCode": "75001", "stateOrProvince": "Île-de-France", "city": "Paris", "addressLine1": "1 Rue de Rivoli"},
+    "EBAY_IT": {"country": "IT", "postalCode": "00100", "stateOrProvince": "Lazio", "city": "Roma", "addressLine1": "Via del Corso 1"},
+    "EBAY_ES": {"country": "ES", "postalCode": "28013", "stateOrProvince": "Madrid", "city": "Madrid", "addressLine1": "Gran Vía 1"},
+    "EBAY_AT": {"country": "AT", "postalCode": "1010", "stateOrProvince": "Wien", "city": "Wien", "addressLine1": "Graben 1"},
+    "EBAY_BE": {"country": "BE", "postalCode": "1000", "stateOrProvince": "Brussels", "city": "Brussels", "addressLine1": "Rue Neuve 1"},
+    "EBAY_CH": {"country": "CH", "postalCode": "8001", "stateOrProvince": "Zürich", "city": "Zürich", "addressLine1": "Bahnhofstrasse 1"},
+    "EBAY_IE": {"country": "IE", "postalCode": "D02", "stateOrProvince": "Dublin", "city": "Dublin", "addressLine1": "1 O'Connell St"},
+    "EBAY_NL": {"country": "NL", "postalCode": "1012", "stateOrProvince": "Noord-Holland", "city": "Amsterdam", "addressLine1": "Damrak 1"},
+    "EBAY_PL": {"country": "PL", "postalCode": "00-001", "stateOrProvince": "Mazowieckie", "city": "Warszawa", "addressLine1": "Marszałkowska 1"},
+    "EBAY_SG": {"country": "SG", "postalCode": "238801", "stateOrProvince": "Singapore", "city": "Singapore", "addressLine1": "1 Orchard Rd"},
+    "EBAY_HK": {"country": "HK", "postalCode": "999077", "stateOrProvince": "Hong Kong", "city": "Hong Kong", "addressLine1": "1 Queens Rd Central"},
+}
+
+
+def _merchant_location_for(marketplace_id: str) -> tuple[str, dict[str, str]]:
+    """Return (location_key, address) for the marketplace. Key is namespaced
+    per marketplace so locations don't collide across countries."""
+    addr = EBAY_MARKETPLACE_LOCATION.get(marketplace_id) or EBAY_MARKETPLACE_LOCATION["EBAY_US"]
+    return (f"DROPLY_{marketplace_id}", addr)
+
+
+# Amazon hostname → eBay marketplace_id. Used to infer the default publish
+# marketplace from a product's source. Falls back to EBAY_US.
+AMAZON_HOST_TO_EBAY = {
+    "www.amazon.com":   "EBAY_US",
+    "amazon.com":       "EBAY_US",
+    "www.amazon.co.uk": "EBAY_GB",
+    "amazon.co.uk":     "EBAY_GB",
+    "www.amazon.de":    "EBAY_DE",
+    "amazon.de":        "EBAY_DE",
+    "www.amazon.fr":    "EBAY_FR",
+    "amazon.fr":        "EBAY_FR",
+    "www.amazon.it":    "EBAY_IT",
+    "amazon.it":        "EBAY_IT",
+    "www.amazon.es":    "EBAY_ES",
+    "amazon.es":        "EBAY_ES",
+    "www.amazon.ca":    "EBAY_CA",
+    "amazon.ca":        "EBAY_CA",
+    "www.amazon.com.au": "EBAY_AU",
+    "amazon.com.au":    "EBAY_AU",
+}
+
+
+def _default_marketplace_for_product(product: dict[str, Any]) -> str:
+    """Pick a sensible default marketplace for a product.
+
+    Precedence: product.preferred_marketplace_id > Amazon-host inference
+    > EBAY_US.
+    """
+    pref = (product.get("preferred_marketplace_id") or "").strip()
+    if pref:
+        return pref
+    source = (product.get("source_marketplace") or "").strip().lower()
+    if source in AMAZON_HOST_TO_EBAY:
+        return AMAZON_HOST_TO_EBAY[source]
+    # Strip a possible leading www.
+    if source.startswith("www."):
+        source = source[4:]
+        if source in AMAZON_HOST_TO_EBAY:
+            return AMAZON_HOST_TO_EBAY[source]
+    return "EBAY_US"
+
+
 def _title_hash(s: str) -> str:
     """Cheap stable key so we cache suggestions per (marketplace, query).
 
@@ -1371,7 +1474,7 @@ class ListEbayIn(BaseModel):
     quantity: int = 1
     title: Optional[str] = None            # override the eBay listing title (≤80 chars)
     category_id: Optional[str] = None      # If None, auto-detect via Taxonomy API (or use stored override)
-    marketplace_id: str = "EBAY_US"
+    marketplace_id: Optional[str] = None   # If None, infer from product.preferred_marketplace_id → source → EBAY_US
     fulfillment_policy_id: Optional[str] = None
     payment_policy_id: Optional[str] = None
     return_policy_id: Optional[str] = None
@@ -1626,7 +1729,7 @@ class ListEbayBulkIn(BaseModel):
     quantity: int = 1
     titles: Optional[dict[str, str]] = None  # asin -> custom title
     category_id: Optional[str] = None        # If None, each product auto-detects (or uses its stored override)
-    marketplace_id: str = "EBAY_US"
+    marketplace_id: Optional[str] = None     # If None, each product uses its preferred_marketplace_id or source-derived default
     override_vero: bool = False
     override_aspects: bool = False
 
@@ -1683,14 +1786,19 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
                 },
             )
 
+    # --- Resolve target marketplace ---
+    # Precedence: explicit body.marketplace_id > product.preferred_marketplace_id
+    # > Amazon-host inference (e.g. amazon.de → EBAY_DE) > EBAY_US.
+    marketplace_id = body.marketplace_id or _default_marketplace_for_product(product)
+
     token = await get_valid_token()
-    content_language = "en-US" if body.marketplace_id == "EBAY_US" else "en-GB"
+    content_language = _content_language(marketplace_id)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Accept-Language": content_language,
         "Content-Language": content_language,
-        "X-EBAY-C-MARKETPLACE-ID": body.marketplace_id,
+        "X-EBAY-C-MARKETPLACE-ID": marketplace_id,
     }
 
     listing_price = body.price
@@ -1700,7 +1808,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         raise HTTPException(400, "No price available. Pass 'price' in the request body.")
 
     sku = f"DROPLY-{asin}"
-    merchant_location_key = "DROPLY_DEFAULT"
+    merchant_location_key, merchant_location_addr = _merchant_location_for(marketplace_id)
     title = (body.title or product.get("title") or asin)[:80]
     description = product.get("description") or title
     images = product.get("images") or []
@@ -1713,7 +1821,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
     category_name = product.get("ebay_category_name")
     if not category_id:
         suggestions = await get_category_suggestions(
-            token=token, marketplace_id=body.marketplace_id, query=title,
+            token=token, marketplace_id=marketplace_id, query=title,
         )
         if not suggestions:
             raise HTTPException(
@@ -1731,7 +1839,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
 
     # --- Build item specifics (aspects) from product data + the category schema ---
     aspect_schema = await get_item_aspects_for_category(
-        token=token, marketplace_id=body.marketplace_id, category_id=category_id,
+        token=token, marketplace_id=marketplace_id, category_id=category_id,
     )
     auto_aspects, missing_required = _autofill_aspects(product=product, schema=aspect_schema)
 
@@ -1758,7 +1866,8 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
             (asin,),
         )
 
-    # Step 0 — ensure a merchant location exists (eBay needs Item.Country)
+    # Step 0 — ensure a merchant location exists (eBay needs the location's
+    # country to match the marketplace, e.g. EBAY_GB needs a GB address).
     async with httpx.AsyncClient() as client:
         r_loc_check = await client.get(
             f"{EBAY_API_BASE}/sell/inventory/v1/location/{merchant_location_key}",
@@ -1766,16 +1875,8 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         )
         if r_loc_check.status_code == 404:
             location_payload = {
-                "location": {
-                    "address": {
-                        "country": "US",
-                        "postalCode": "94103",
-                        "stateOrProvince": "CA",
-                        "city": "San Francisco",
-                        "addressLine1": "1 Market St",
-                    }
-                },
-                "name": "Droply Default Location",
+                "location": {"address": merchant_location_addr},
+                "name": f"Droply Default Location ({marketplace_id})",
                 "merchantLocationStatus": "ENABLED",
                 "locationTypes": ["WAREHOUSE"],
             }
@@ -1823,7 +1924,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
     # Step 2 — create offer
     offer_payload: dict[str, Any] = {
         "sku": sku,
-        "marketplaceId": body.marketplace_id,
+        "marketplaceId": marketplace_id,
         "format": "FIXED_PRICE",
         "listingDescription": description[:500],
         "categoryId": category_id,
@@ -1845,7 +1946,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
             "returnPolicyId": body.return_policy_id,
         }
     else:
-        policies = await ensure_business_policies(headers, body.marketplace_id)
+        policies = await ensure_business_policies(headers, marketplace_id)
     offer_payload["listingPolicies"] = policies
 
     async with httpx.AsyncClient() as client:
@@ -1853,7 +1954,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         r_check = await client.get(
             f"{EBAY_API_BASE}/sell/inventory/v1/offer",
             headers=headers,
-            params={"sku": sku, "marketplace_id": body.marketplace_id},
+            params={"sku": sku, "marketplace_id": marketplace_id},
         )
         existing_offer_id = None
         if r_check.status_code == 200:
@@ -1908,7 +2009,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
             markup_pct = 0.0
     save_listing(
         asin=asin,
-        marketplace_id=body.marketplace_id,
+        marketplace_id=marketplace_id,
         sku=sku,
         offer_id=offer_id,
         listing_id=listing_id,
@@ -1936,6 +2037,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         "category_id": category_id,
         "category_name": category_name,
         "aspects": final_aspects,
+        "marketplace_id": marketplace_id,
     }
 
 
@@ -1951,6 +2053,10 @@ class CategoryOverrideIn(BaseModel):
 
 class AspectsOverrideIn(BaseModel):
     aspects: dict[str, list[str]]
+
+
+class MarketplaceOverrideIn(BaseModel):
+    marketplace_id: Optional[str]  # null clears the override → re-infer from source
 
 
 @app.post("/api/products/{asin}/suggest-category")
@@ -1988,6 +2094,43 @@ def api_set_category(asin: str, payload: CategoryOverrideIn):
             (payload.category_id, payload.category_name, asin),
         )
     return {"ok": True}
+
+
+@app.get("/api/marketplaces")
+def api_list_marketplaces():
+    """List the eBay marketplaces Droply knows how to publish to.
+
+    The dropdown on the Products page reads this. Each entry includes the
+    default merchant-location country so the UI can warn users their address
+    is a placeholder.
+    """
+    out = []
+    for mp in EBAY_CATEGORY_TREE_IDS.keys():
+        addr = EBAY_MARKETPLACE_LOCATION.get(mp) or {}
+        out.append({
+            "marketplace_id": mp,
+            "language": EBAY_MARKETPLACE_LANG.get(mp, "en-US"),
+            "country": addr.get("country"),
+            "default_city": addr.get("city"),
+        })
+    return out
+
+
+@app.put("/api/products/{asin}/marketplace")
+def api_set_marketplace(asin: str, payload: MarketplaceOverrideIn):
+    """Pin a product to a specific eBay marketplace. Pass null to clear."""
+    mp = (payload.marketplace_id or "").strip() or None
+    if mp and mp not in EBAY_CATEGORY_TREE_IDS:
+        raise HTTPException(400, f"Unknown marketplace_id '{mp}'")
+    with db() as conn:
+        existing = conn.execute("SELECT 1 FROM products WHERE asin = ?", (asin,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Product not found")
+        conn.execute(
+            "UPDATE products SET preferred_marketplace_id = ? WHERE asin = ?",
+            (mp, asin),
+        )
+    return {"ok": True, "marketplace_id": mp}
 
 
 @app.put("/api/products/{asin}/aspects")

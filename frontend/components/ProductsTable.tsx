@@ -2,7 +2,7 @@
 
 import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon, ShieldAlert, Layers, AlertTriangle, PauseCircle, PlayCircle } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { api, AppSettings, EbayListing, Product, VeroMatch, computeNet } from "@/lib/api";
+import { api, AppSettings, EbayListing, EbayMarketplace, Product, VeroMatch, computeNet } from "@/lib/api";
 import { money, date } from "@/lib/format";
 import PriceHistoryModal from "./PriceHistoryModal";
 import TitleOptimizerModal from "./TitleOptimizerModal";
@@ -63,6 +63,7 @@ export default function ProductsTable({
 
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [veroMap, setVeroMap] = useState<Record<string, VeroMatch[]>>({});
+  const [marketplaces, setMarketplaces] = useState<EbayMarketplace[]>([]);
   const markupPercent = settings?.markup_percent ?? DEFAULT_MARKUP_PERCENT;
 
   async function loadVero() {
@@ -80,6 +81,7 @@ export default function ProductsTable({
       .catch(() => {});
     loadListings();
     loadVero();
+    api<EbayMarketplace[]>("/api/marketplaces").then(setMarketplaces).catch(() => {});
     api<AppSettings>("/api/settings").then(setSettings).catch(() => {});
   }, []);
 
@@ -145,6 +147,21 @@ export default function ProductsTable({
       } else {
         flash(e.message || "eBay listing failed.", "err");
       }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function setMarketplace(p: Product, marketplaceId: string | null) {
+    setBusy(p.asin);
+    try {
+      await api(`/api/products/${encodeURIComponent(p.asin)}/marketplace`, {
+        method: "PUT",
+        body: JSON.stringify({ marketplace_id: marketplaceId }),
+      });
+      onChange?.();
+    } catch (e: any) {
+      flash(e.message || "Failed to set marketplace.", "err");
     } finally {
       setBusy(null);
     }
@@ -439,14 +456,14 @@ export default function ProductsTable({
                             className={`btn-primary text-xs ${listing.paused ? "opacity-60" : ""}`}
                             title={
                               listing.paused
-                                ? `Paused (${listing.paused_reason === "amazon_oos" ? "Amazon out of stock" : "manual"}) — quantity is 0 on eBay`
-                                : `Listed on eBay at ${money(listing.last_price, listing.currency || p.currency)}`
+                                ? `Paused (${listing.paused_reason === "amazon_oos" ? "Amazon out of stock" : "manual"}) — quantity is 0 on eBay · ${listing.marketplace_id}`
+                                : `Listed on ${listing.marketplace_id} at ${money(listing.last_price, listing.currency || p.currency)}`
                             }
                           >
                             {listing.paused ? <PauseCircle size={14} /> : <CheckCircle2 size={14} />}
                             {listing.paused
-                              ? "Paused"
-                              : `Listed @ ${money(listing.last_price, listing.currency || p.currency)}`}
+                              ? `Paused (${listing.marketplace_id.replace("EBAY_", "")})`
+                              : `${listing.marketplace_id.replace("EBAY_", "")} @ ${money(listing.last_price, listing.currency || p.currency)}`}
                           </a>
                           {listing.paused ? (
                             <button
@@ -469,25 +486,43 @@ export default function ProductsTable({
                           )}
                         </>
                       ) : (
-                        <button
-                          onClick={() =>
-                            ebayConnected ? openPublishFlow(p) : listOnEbayManual(p)
-                          }
-                          disabled={isBusy}
-                          className="btn-primary text-xs"
-                          title={
-                            ebayConnected
-                              ? "Publish to eBay via API"
-                              : "Copy details and open eBay listing flow"
-                          }
-                        >
-                          {isBusy ? (
-                            <Loader2 size={14} className="animate-spin" />
-                          ) : (
-                            <Tag size={14} />
+                        <>
+                          {marketplaces.length > 0 && ebayConnected && (
+                            <select
+                              value={p.preferred_marketplace_id || ""}
+                              onChange={(e) => setMarketplace(p, e.target.value || null)}
+                              disabled={isBusy}
+                              className="rounded border border-border bg-panel2 px-2 py-1 text-xs"
+                              title="Publish to this eBay marketplace"
+                            >
+                              <option value="">Auto</option>
+                              {marketplaces.map((m) => (
+                                <option key={m.marketplace_id} value={m.marketplace_id}>
+                                  {m.marketplace_id.replace("EBAY_", "")}
+                                </option>
+                              ))}
+                            </select>
                           )}
-                          {ebayConnected ? "Publish to eBay" : "List on eBay"}
-                        </button>
+                          <button
+                            onClick={() =>
+                              ebayConnected ? openPublishFlow(p) : listOnEbayManual(p)
+                            }
+                            disabled={isBusy}
+                            className="btn-primary text-xs"
+                            title={
+                              ebayConnected
+                                ? "Publish to eBay via API"
+                                : "Copy details and open eBay listing flow"
+                            }
+                          >
+                            {isBusy ? (
+                              <Loader2 size={14} className="animate-spin" />
+                            ) : (
+                              <Tag size={14} />
+                            )}
+                            {ebayConnected ? "Publish to eBay" : "List on eBay"}
+                          </button>
+                        </>
                       )}
                       <button
                         onClick={() => setAspectsProduct(p)}
