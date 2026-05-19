@@ -123,6 +123,9 @@ export type Order = {
   tracking_checked_at: string | null;
   created_at: string;
   synced_at: string | null;
+  // Phase 3.1 — dispatch deadline + derived urgency flag from /api/orders
+  dispatch_deadline?: string | null;
+  urgent?: boolean;
 };
 
 export const CARRIER_TRACKING_URLS: Record<string, string> = {
@@ -191,6 +194,9 @@ export type AppSettings = {
   scheduler_enabled?: boolean;
   default_description_template_slug?: string;
   margin_rules?: MarginRule[];
+  // Phase 3.1
+  dispatch_deadline_business_days?: number;
+  dispatch_deadline_urgent_hours?: number;
 };
 
 export type MarginRule = {

@@ -266,6 +266,18 @@ export default function OrdersPage() {
                       >
                         {o.tracking_number ? "shipped" : o.status}
                       </span>
+                      {o.urgent && (
+                        <span
+                          className="badge bg-red-500/15 text-red-300"
+                          title={
+                            o.dispatch_deadline
+                              ? `Dispatch deadline: ${new Date(o.dispatch_deadline).toLocaleString()}`
+                              : "Dispatch deadline approaching"
+                          }
+                        >
+                          ⚠ ship soon
+                        </span>
+                      )}
                     </div>
                     <div className="mt-0.5 text-sm font-medium">
                       {o.ship_to_name || o.buyer_username || "—"} ·{" "}

@@ -246,6 +246,9 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE orders ADD COLUMN tracking_status_text TEXT")
             if "tracking_checked_at" not in cols:
                 conn.execute("ALTER TABLE orders ADD COLUMN tracking_checked_at TEXT")
+            # Phase 3.1 — eBay dispatch deadline (computed at order persist time)
+            if "dispatch_deadline" not in cols:
+                conn.execute("ALTER TABLE orders ADD COLUMN dispatch_deadline TEXT")
 
         # Migrate the old orders schema (auto-incrementing id) → new ebay_order_id PK
         cur = conn.execute("PRAGMA table_info(orders)").fetchall()
@@ -345,8 +348,12 @@ def init_db() -> None:
                 tracking_number TEXT,
                 tracking_carrier TEXT,
                 tracking_submitted_at TEXT,
+                tracking_status TEXT,
+                tracking_status_text TEXT,
+                tracking_checked_at TEXT,
                 created_at TEXT,
-                synced_at TEXT
+                synced_at TEXT,
+                dispatch_deadline TEXT
             )
         """)
         # Active eBay listings (one row per ASIN/marketplace pair)
@@ -883,6 +890,12 @@ DEFAULT_SETTINGS = {
     "easypost_cache_ttl_minutes": "60",  # Re-poll EasyPost at most this often per (carrier, number)
     # Background scheduler — when "true", APScheduler runs the recurring jobs
     "scheduler_enabled": "true",
+    # Phase 3.1 — eBay default handling time for new orders, in business days.
+    # Used to compute dispatch_deadline = created_at + N business days. Most
+    # sellers ship within 1–2 days; Top Rated sellers commit to 1.
+    "dispatch_deadline_business_days": "2",
+    # Phase 3.1 — flag an order as "urgent" this many hours before its deadline.
+    "dispatch_deadline_urgent_hours": "6",
     # Description template used at publish time. Empty string = use raw
     # product description (the Amazon bullets).
     "default_description_template_slug": "default",
@@ -2676,6 +2689,9 @@ def api_get_settings():
         "easypost_cache_ttl_minutes": float(s.get("easypost_cache_ttl_minutes", "60")),
         # In-process job scheduler
         "scheduler_enabled": s.get("scheduler_enabled", "true").lower() == "true",
+        # Phase 3.1 — dispatch deadline + urgency window
+        "dispatch_deadline_business_days": float(s.get("dispatch_deadline_business_days", "2")),
+        "dispatch_deadline_urgent_hours": float(s.get("dispatch_deadline_urgent_hours", "6")),
         # Phase 2.3: which description template to render at publish time.
         # Empty string = skip the template and use the raw Amazon description.
         "default_description_template_slug": s.get("default_description_template_slug", "default"),
@@ -2703,6 +2719,8 @@ class SettingsIn(BaseModel):
     easypost_api_key: Optional[str] = None
     easypost_cache_ttl_minutes: Optional[float] = None
     scheduler_enabled: Optional[bool] = None
+    dispatch_deadline_business_days: Optional[float] = None
+    dispatch_deadline_urgent_hours: Optional[float] = None
     default_description_template_slug: Optional[str] = None
     margin_rules: Optional[list[dict[str, Any]]] = None
 
@@ -2761,6 +2779,10 @@ def api_update_settings(payload: SettingsIn):
         set_setting("easypost_cache_ttl_minutes", str(payload.easypost_cache_ttl_minutes))
     if payload.scheduler_enabled is not None:
         set_setting("scheduler_enabled", "true" if payload.scheduler_enabled else "false")
+    if payload.dispatch_deadline_business_days is not None:
+        set_setting("dispatch_deadline_business_days", str(payload.dispatch_deadline_business_days))
+    if payload.dispatch_deadline_urgent_hours is not None:
+        set_setting("dispatch_deadline_urgent_hours", str(payload.dispatch_deadline_urgent_hours))
     if payload.default_description_template_slug is not None:
         set_setting("default_description_template_slug", payload.default_description_template_slug)
     if payload.margin_rules is not None:
@@ -2903,6 +2925,67 @@ EASYPOST_STATUS_MAP = {
     "error":                 "exception",
     "unknown":               "unknown",
 }
+
+
+def _add_business_days(start: datetime, days: int) -> datetime:
+    """Walk forward `days` business days from `start`, skipping Sat/Sun.
+
+    Holidays aren't recognised (would need per-marketplace calendars). Good
+    enough for the dispatch-deadline alert; users always have a few hours
+    of buffer.
+    """
+    cur = start
+    remaining = max(0, int(days))
+    while remaining > 0:
+        cur = cur + timedelta(days=1)
+        if cur.weekday() < 5:  # 0=Mon … 4=Fri
+            remaining -= 1
+    return cur
+
+
+def _compute_dispatch_deadline_iso(created_at_iso: str) -> Optional[str]:
+    """Compute the dispatch deadline ISO timestamp for an order.
+
+    Reads `dispatch_deadline_business_days` from settings; falls back to 2.
+    Returns None if the input timestamp can't be parsed.
+    """
+    if not created_at_iso:
+        return None
+    try:
+        created = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    try:
+        days = int(float(get_settings_dict().get("dispatch_deadline_business_days") or 2))
+    except (TypeError, ValueError):
+        days = 2
+    return _add_business_days(created, days).isoformat()
+
+
+def _is_order_urgent(order: dict[str, Any], now: Optional[datetime] = None) -> bool:
+    """An order is urgent when its dispatch_deadline is within
+    `dispatch_deadline_urgent_hours` and no tracking number has been
+    submitted yet.
+    """
+    if order.get("tracking_number"):
+        return False
+    deadline_iso = order.get("dispatch_deadline")
+    if not deadline_iso:
+        return False
+    try:
+        deadline = datetime.fromisoformat(deadline_iso.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    try:
+        urgent_h = float(get_settings_dict().get("dispatch_deadline_urgent_hours") or 6)
+    except (TypeError, ValueError):
+        urgent_h = 6.0
+    return (deadline - now).total_seconds() <= urgent_h * 3600.0
 
 
 def carrier_tracking_url(carrier: Optional[str], number: Optional[str]) -> Optional[str]:
@@ -4131,7 +4214,26 @@ async def api_listing_resume(asin: str, marketplace_id: str):
 def list_orders():
     with db() as conn:
         rows = conn.execute("SELECT * FROM orders ORDER BY created_at DESC").fetchall()
-    return [dict(r) for r in rows]
+    # Phase 3.1 — backfill dispatch_deadline lazily for pre-existing orders
+    # and emit a derived `urgent` flag so the UI can badge "due soon".
+    out: list[dict[str, Any]] = []
+    missing: list[tuple[str, str]] = []
+    for r in rows:
+        d = dict(r)
+        if not d.get("dispatch_deadline") and d.get("created_at"):
+            iso = _compute_dispatch_deadline_iso(d["created_at"])
+            if iso:
+                d["dispatch_deadline"] = iso
+                missing.append((iso, d["ebay_order_id"]))
+        d["urgent"] = _is_order_urgent(d)
+        out.append(d)
+    if missing:
+        with db() as conn:
+            conn.executemany(
+                "UPDATE orders SET dispatch_deadline = ? WHERE ebay_order_id = ?",
+                missing,
+            )
+    return out
 
 
 def _addr_field(addr: dict, *keys, default="") -> str:
@@ -4186,8 +4288,8 @@ def _persist_order(order: dict[str, Any]) -> None:
                 ship_to_state, ship_to_postal, ship_to_country,
                 sale_price, amazon_cost, profit, currency,
                 status, tracking_number, tracking_carrier, tracking_submitted_at,
-                created_at, synced_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                created_at, synced_at, dispatch_deadline
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(ebay_order_id) DO UPDATE SET
                 product_asin=excluded.product_asin,
                 sku=excluded.sku,
@@ -4206,7 +4308,8 @@ def _persist_order(order: dict[str, Any]) -> None:
                 profit=excluded.profit,
                 currency=excluded.currency,
                 status=excluded.status,
-                synced_at=excluded.synced_at
+                synced_at=excluded.synced_at,
+                dispatch_deadline=COALESCE(orders.dispatch_deadline, excluded.dispatch_deadline)
             """,
             (
                 order.get("orderId"),
@@ -4232,6 +4335,7 @@ def _persist_order(order: dict[str, Any]) -> None:
                 None, None, None,
                 order.get("creationDate") or now,
                 now,
+                _compute_dispatch_deadline_iso(order.get("creationDate") or now),
             ),
         )
     return is_new

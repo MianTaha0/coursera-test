@@ -10,10 +10,11 @@ import {
   ResponsiveContainer,
   CartesianGrid,
 } from "recharts";
-import { DollarSign, Package, ShoppingCart, Activity, AlertCircle, Bell, TrendingUp, TrendingDown, Wallet } from "lucide-react";
+import { DollarSign, Package, ShoppingCart, Activity, AlertCircle, Bell, TrendingUp, TrendingDown, Wallet, AlertTriangle } from "lucide-react";
+import Link from "next/link";
 import StatsCard from "@/components/StatsCard";
 import ProductsTable from "@/components/ProductsTable";
-import { api, Alert, AppSettings, Product, Stats, computeNet } from "@/lib/api";
+import { api, Alert, AppSettings, Order, Product, Stats, computeNet } from "@/lib/api";
 import { money } from "@/lib/format";
 
 export default function DashboardPage() {
@@ -21,6 +22,7 @@ export default function DashboardPage() {
   const [recent, setRecent] = useState<Product[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [allProducts, setAllProducts] = useState<Product[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -28,24 +30,28 @@ export default function DashboardPage() {
   async function load() {
     try {
       setErr(null);
-      const [s, p, a, all, cfg] = await Promise.all([
+      const [s, p, a, all, cfg, o] = await Promise.all([
         api<Stats>("/api/stats"),
         api<Product[]>("/api/products?limit=8"),
         api<Alert[]>("/api/alerts?days=30&limit=8"),
         api<Product[]>("/api/products?limit=500"),
         api<AppSettings>("/api/settings"),
+        api<Order[]>("/api/orders"),
       ]);
       setStats(s);
       setRecent(p);
       setAlerts(a);
       setAllProducts(all);
       setSettings(cfg);
+      setOrders(o);
     } catch (e: any) {
       setErr(e.message || String(e));
     } finally {
       setLoading(false);
     }
   }
+
+  const urgentCount = orders.filter((o) => o.urgent).length;
 
   // Sum of projected net profit across the whole library at current markup
   const projectedProfit = (() => {
@@ -88,6 +94,23 @@ export default function DashboardPage() {
             <div className="text-xs opacity-70">{err}</div>
           </div>
         </div>
+      )}
+
+      {urgentCount > 0 && (
+        <Link
+          href="/orders"
+          className="flex items-center gap-3 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-200 hover:border-red-500/70"
+        >
+          <AlertTriangle size={18} className="shrink-0 text-red-300" />
+          <div className="flex-1">
+            <div className="font-semibold">
+              {urgentCount} order{urgentCount === 1 ? "" : "s"} need shipping soon
+            </div>
+            <div className="text-xs text-red-200/80">
+              These orders are within their eBay dispatch window — click to view.
+            </div>
+          </div>
+        </Link>
       )}
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
