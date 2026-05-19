@@ -492,6 +492,23 @@ init_db()
 
 
 # ---------------------------------------------------------------------------
+# Background scheduler — AsyncIOScheduler needs a running event loop, so
+# wire it through FastAPI's startup/shutdown hooks rather than module init.
+# ---------------------------------------------------------------------------
+from backend import scheduler as _droply_scheduler  # noqa: E402
+
+
+@app.on_event("startup")
+async def _start_droply_scheduler() -> None:
+    _droply_scheduler.start()
+
+
+@app.on_event("shutdown")
+async def _stop_droply_scheduler() -> None:
+    _droply_scheduler.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Helpers — products
 # ---------------------------------------------------------------------------
 def row_to_product(r: sqlite3.Row) -> dict[str, Any]:
@@ -625,6 +642,8 @@ DEFAULT_SETTINGS = {
     # Carrier tracking (EasyPost)
     "easypost_api_key": "",
     "easypost_cache_ttl_minutes": "60",  # Re-poll EasyPost at most this often per (carrier, number)
+    # Background scheduler — when "true", APScheduler runs the recurring jobs
+    "scheduler_enabled": "true",
 }
 
 
@@ -1614,6 +1633,8 @@ def api_get_settings():
         # EasyPost — never return the raw key; only indicate whether it's set
         "easypost_api_key_set": bool(s.get("easypost_api_key", "").strip()),
         "easypost_cache_ttl_minutes": float(s.get("easypost_cache_ttl_minutes", "60")),
+        # In-process job scheduler
+        "scheduler_enabled": s.get("scheduler_enabled", "true").lower() == "true",
     }
 
 
@@ -1632,6 +1653,7 @@ class SettingsIn(BaseModel):
     amazon_shipping_cost: Optional[float] = None
     easypost_api_key: Optional[str] = None
     easypost_cache_ttl_minutes: Optional[float] = None
+    scheduler_enabled: Optional[bool] = None
 
 
 @app.put("/api/settings")
@@ -1676,6 +1698,8 @@ def api_update_settings(payload: SettingsIn):
             set_setting("easypost_api_key", payload.easypost_api_key.strip())
     if payload.easypost_cache_ttl_minutes is not None:
         set_setting("easypost_cache_ttl_minutes", str(payload.easypost_cache_ttl_minutes))
+    if payload.scheduler_enabled is not None:
+        set_setting("scheduler_enabled", "true" if payload.scheduler_enabled else "false")
     return api_get_settings()
 
 
@@ -2214,6 +2238,26 @@ def list_outbound_messages(
     with db() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/scheduler/status")
+def api_scheduler_status():
+    return _droply_scheduler.status()
+
+
+@app.post("/api/scheduler/run-now/{job_id}")
+async def api_scheduler_run_now(job_id: str):
+    """Fire a specific scheduler job immediately (useful for sandbox testing)."""
+    valid = {"message_flush", "order_sync", "tracking_refresh"}
+    if job_id not in valid:
+        raise HTTPException(400, f"unknown job '{job_id}'. expected one of {sorted(valid)}")
+    if job_id == "message_flush":
+        return await flush_outbound_messages(limit=50)
+    if job_id == "order_sync":
+        return await sync_orders(limit=50)
+    if job_id == "tracking_refresh":
+        return await refresh_all_tracking()
+    raise HTTPException(500, "unreachable")
 
 
 @app.post("/api/messages/outbound/flush")
