@@ -13,6 +13,7 @@ node_modules/
 out/
 dist/
 .vercel/
+*.tsbuildinfo
 
 # OS
 .DS_Store
