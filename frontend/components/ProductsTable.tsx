@@ -1,6 +1,6 @@
 "use client";
 
-import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon, ShieldAlert, Layers, AlertTriangle } from "lucide-react";
+import { ExternalLink, Tag, Trash2, Loader2, CheckCircle2, LineChart as LineChartIcon, ShieldAlert, Layers, AlertTriangle, PauseCircle, PlayCircle } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api, AppSettings, EbayListing, Product, VeroMatch, computeNet } from "@/lib/api";
 import { money, date } from "@/lib/format";
@@ -145,6 +145,38 @@ export default function ProductsTable({
       } else {
         flash(e.message || "eBay listing failed.", "err");
       }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function pauseListing(p: Product, listing: EbayListing) {
+    setBusy(p.asin);
+    try {
+      await api(
+        `/api/listings/${encodeURIComponent(p.asin)}/${encodeURIComponent(listing.marketplace_id)}/pause`,
+        { method: "POST" },
+      );
+      flash("Listing paused (quantity → 0 on eBay).", "ok");
+      await loadListings();
+    } catch (e: any) {
+      flash(e.message || "Pause failed.", "err");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function resumeListing(p: Product, listing: EbayListing) {
+    setBusy(p.asin);
+    try {
+      const r = await api<{ ok: boolean; quantity: number }>(
+        `/api/listings/${encodeURIComponent(p.asin)}/${encodeURIComponent(listing.marketplace_id)}/resume`,
+        { method: "POST" },
+      );
+      flash(`Listing resumed (qty ${r.quantity}).`, "ok");
+      await loadListings();
+    } catch (e: any) {
+      flash(e.message || "Resume failed.", "err");
     } finally {
       setBusy(null);
     }
@@ -399,16 +431,43 @@ export default function ProductsTable({
                   <td className="td text-right">
                     <div className="flex justify-end gap-2">
                       {listing?.listing_url ? (
-                        <a
-                          href={listing.listing_url}
-                          target="_blank"
-                          rel="noopener"
-                          className="btn-primary text-xs"
-                          title={`Listed on eBay at ${money(listing.last_price, listing.currency || p.currency)}`}
-                        >
-                          <CheckCircle2 size={14} />
-                          Listed @ {money(listing.last_price, listing.currency || p.currency)}
-                        </a>
+                        <>
+                          <a
+                            href={listing.listing_url}
+                            target="_blank"
+                            rel="noopener"
+                            className={`btn-primary text-xs ${listing.paused ? "opacity-60" : ""}`}
+                            title={
+                              listing.paused
+                                ? `Paused (${listing.paused_reason === "amazon_oos" ? "Amazon out of stock" : "manual"}) — quantity is 0 on eBay`
+                                : `Listed on eBay at ${money(listing.last_price, listing.currency || p.currency)}`
+                            }
+                          >
+                            {listing.paused ? <PauseCircle size={14} /> : <CheckCircle2 size={14} />}
+                            {listing.paused
+                              ? "Paused"
+                              : `Listed @ ${money(listing.last_price, listing.currency || p.currency)}`}
+                          </a>
+                          {listing.paused ? (
+                            <button
+                              onClick={() => resumeListing(p, listing)}
+                              disabled={isBusy}
+                              className="btn-secondary text-xs"
+                              title="Restore quantity on eBay"
+                            >
+                              <PlayCircle size={14} />
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => pauseListing(p, listing)}
+                              disabled={isBusy}
+                              className="btn-secondary text-xs"
+                              title="Set quantity to 0 on eBay (keep the listing)"
+                            >
+                              <PauseCircle size={14} />
+                            </button>
+                          )}
+                        </>
                       ) : (
                         <button
                           onClick={() =>

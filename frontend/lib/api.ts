@@ -275,6 +275,10 @@ export type EbayListing = {
   markup_percent: number | null;
   listed_at: string | null;
   updated_at: string | null;
+  paused?: number;                  // 1 when quantity has been set to 0
+  paused_at?: string | null;
+  paused_reason?: "amazon_oos" | "manual" | null;
+  last_quantity?: number;
 };
 
 export type EbayStatus = {

@@ -236,6 +236,22 @@ def init_db() -> None:
             if "last_attempt_at" not in ocols:
                 conn.execute("ALTER TABLE outbound_messages ADD COLUMN last_attempt_at TEXT")
 
+        # Additive migration for ebay_listings: inventory-sync state.
+        # `paused` = 1 when Droply has set the listing's quantity to 0 because
+        # the upstream Amazon product went out of stock. `last_quantity` holds
+        # the pre-pause quantity so we can restore it when stock comes back.
+        cur = conn.execute("PRAGMA table_info(ebay_listings)").fetchall()
+        if cur:
+            lcols = {c["name"] for c in cur}
+            if "paused" not in lcols:
+                conn.execute("ALTER TABLE ebay_listings ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+            if "paused_at" not in lcols:
+                conn.execute("ALTER TABLE ebay_listings ADD COLUMN paused_at TEXT")
+            if "paused_reason" not in lcols:
+                conn.execute("ALTER TABLE ebay_listings ADD COLUMN paused_reason TEXT")
+            if "last_quantity" not in lcols:
+                conn.execute("ALTER TABLE ebay_listings ADD COLUMN last_quantity INTEGER NOT NULL DEFAULT 1")
+
         # Additive migration for products: store the resolved eBay category so
         # we don't re-call the Taxonomy API on every publish, plus item
         # specifics (Phase 2.2): aspects, scraped Amazon spec table, and a
@@ -317,6 +333,10 @@ def init_db() -> None:
                 markup_percent REAL,
                 listed_at TEXT,
                 updated_at TEXT,
+                paused INTEGER NOT NULL DEFAULT 0,
+                paused_at TEXT,
+                paused_reason TEXT,
+                last_quantity INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (asin, marketplace_id)
             )
         """)
@@ -726,7 +746,7 @@ def set_setting(key: str, value: str) -> None:
 def save_listing(
     *, asin: str, marketplace_id: str, sku: str, offer_id: str,
     listing_id: str, listing_url: str, price: float, currency: str,
-    markup_percent: float,
+    markup_percent: float, quantity: int = 1,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with db() as conn:
@@ -734,8 +754,8 @@ def save_listing(
             """
             INSERT INTO ebay_listings (asin, marketplace_id, sku, offer_id, listing_id,
                                        listing_url, last_price, currency, markup_percent,
-                                       listed_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                       listed_at, updated_at, last_quantity, paused)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)
             ON CONFLICT(asin, marketplace_id) DO UPDATE SET
                 sku=excluded.sku,
                 offer_id=excluded.offer_id,
@@ -744,10 +764,14 @@ def save_listing(
                 last_price=excluded.last_price,
                 currency=excluded.currency,
                 markup_percent=excluded.markup_percent,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                last_quantity=excluded.last_quantity,
+                paused=0,
+                paused_at=NULL,
+                paused_reason=NULL
             """,
             (asin, marketplace_id, sku, offer_id, listing_id, listing_url,
-             price, currency, markup_percent, now, now),
+             price, currency, markup_percent, now, now, quantity),
         )
 
 
@@ -784,6 +808,109 @@ async def update_offer_price(offer_id: str, price: float, currency: str, marketp
             headers=headers,
         )
         return rpub.status_code in (200, 201)
+
+
+async def update_listing_quantity(
+    *, sku: str, marketplace_id: str, quantity: int,
+) -> tuple[bool, str]:
+    """Set the eBay inventory item's availableQuantity for a SKU.
+
+    Returns (ok, detail). We PUT the inventory_item rather than calling
+    bulkUpdatePriceQuantity because we already have the SKU and the inventory
+    endpoint is the canonical place that holds stock.
+    """
+    try:
+        token = await get_valid_token()
+    except HTTPException as e:
+        return (False, f"no eBay token: {e.detail}")
+
+    content_language = "en-US" if marketplace_id == "EBAY_US" else "en-GB"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept-Language": content_language,
+        "Content-Language": content_language,
+        "X-EBAY-C-MARKETPLACE-ID": marketplace_id,
+    }
+    # eBay's PUT requires the full inventory item; fetch then patch availability.
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            rg = await client.get(
+                f"{EBAY_API_BASE}/sell/inventory/v1/inventory_item/{sku}",
+                headers=headers,
+            )
+            if rg.status_code != 200:
+                return (False, f"GET inventory_item failed: HTTP {rg.status_code}")
+            item = rg.json()
+            item.setdefault("availability", {}).setdefault("shipToLocationAvailability", {})
+            item["availability"]["shipToLocationAvailability"]["quantity"] = int(quantity)
+            rp = await client.put(
+                f"{EBAY_API_BASE}/sell/inventory/v1/inventory_item/{sku}",
+                headers=headers,
+                json=item,
+            )
+    except httpx.HTTPError as e:
+        return (False, f"http error: {e}")
+
+    if rp.status_code in (200, 204):
+        return (True, "updated")
+    return (False, f"PUT failed: HTTP {rp.status_code} {rp.text[:200]}")
+
+
+async def maybe_sync_inventory(asin: str, new_stock_status: str) -> None:
+    """Sync eBay availability with the latest Amazon stock signal.
+
+    Called after a product upsert. If the product went out of stock and we
+    have an active listing, pause it (quantity → 0). If it came back in stock
+    and the listing is paused-by-Droply, restore the previous quantity.
+
+    Listings paused manually by the user (with reason='manual') are left alone
+    when stock comes back — the user can resume them explicitly.
+    """
+    if not new_stock_status:
+        return
+    with db() as conn:
+        listings = conn.execute(
+            "SELECT * FROM ebay_listings WHERE asin = ?", (asin,)
+        ).fetchall()
+    if not listings:
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for listing in listings:
+        sku = listing["sku"]
+        marketplace_id = listing["marketplace_id"]
+
+        if new_stock_status == "out_of_stock" and not listing["paused"]:
+            ok, detail = await update_listing_quantity(
+                sku=sku, marketplace_id=marketplace_id, quantity=0,
+            )
+            if ok:
+                with db() as conn:
+                    conn.execute(
+                        """UPDATE ebay_listings
+                              SET paused = 1, paused_at = ?, paused_reason = 'amazon_oos',
+                                  updated_at = ?
+                            WHERE asin = ? AND marketplace_id = ?""",
+                        (now_iso, now_iso, asin, marketplace_id),
+                    )
+
+        elif new_stock_status == "in_stock" and listing["paused"] and (
+            listing["paused_reason"] == "amazon_oos"
+        ):
+            qty = int(listing["last_quantity"] or 1)
+            ok, detail = await update_listing_quantity(
+                sku=sku, marketplace_id=marketplace_id, quantity=qty,
+            )
+            if ok:
+                with db() as conn:
+                    conn.execute(
+                        """UPDATE ebay_listings
+                              SET paused = 0, paused_at = NULL, paused_reason = NULL,
+                                  updated_at = ?
+                            WHERE asin = ? AND marketplace_id = ?""",
+                        (now_iso, asin, marketplace_id),
+                    )
 
 
 async def maybe_auto_reprice(asin: str, new_amazon_price: Optional[float]) -> None:
@@ -1789,6 +1916,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         price=listing_price,
         currency=(product.get("currency") or "USD"),
         markup_percent=markup_pct,
+        quantity=body.quantity,
     )
 
     # Persist the aspects we actually published so the UI reflects ground truth.
@@ -1983,12 +2111,15 @@ def _upsert(conn: sqlite3.Connection, p: ProductIn) -> dict[str, Any]:
 def save_product(payload: ProductIn, background: BackgroundTasks):
     with db() as conn:
         prev = conn.execute(
-            "SELECT price FROM products WHERE asin = ?", (payload.asin,)
+            "SELECT price, stock_status FROM products WHERE asin = ?", (payload.asin,)
         ).fetchone()
         prev_price = prev["price"] if prev else None
+        prev_stock = prev["stock_status"] if prev else None
         product = _upsert(conn, payload)
     if payload.price is not None and prev_price != payload.price:
         background.add_task(maybe_auto_reprice, payload.asin, payload.price)
+    if payload.stock_status and payload.stock_status != prev_stock:
+        background.add_task(maybe_sync_inventory, payload.asin, payload.stock_status)
     return {"ok": True, "product": product}
 
 
@@ -1997,11 +2128,16 @@ def save_products_bulk(payload: list[ProductIn], background: BackgroundTasks):
     out = []
     with db() as conn:
         for p in payload:
-            prev = conn.execute("SELECT price FROM products WHERE asin = ?", (p.asin,)).fetchone()
+            prev = conn.execute(
+                "SELECT price, stock_status FROM products WHERE asin = ?", (p.asin,)
+            ).fetchone()
             prev_price = prev["price"] if prev else None
+            prev_stock = prev["stock_status"] if prev else None
             out.append(_upsert(conn, p))
             if p.price is not None and prev_price != p.price:
                 background.add_task(maybe_auto_reprice, p.asin, p.price)
+            if p.stock_status and p.stock_status != prev_stock:
+                background.add_task(maybe_sync_inventory, p.asin, p.stock_status)
     return {"ok": True, "count": len(out), "products": out}
 
 
@@ -2931,6 +3067,67 @@ def api_listings():
             "SELECT * FROM ebay_listings ORDER BY updated_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.post("/api/listings/{asin}/{marketplace_id}/pause")
+async def api_listing_pause(asin: str, marketplace_id: str):
+    """Manually set the eBay listing's quantity to 0 (without delisting)."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM ebay_listings WHERE asin = ? AND marketplace_id = ?",
+            (asin, marketplace_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Listing not found")
+    if row["paused"]:
+        return {"ok": True, "already_paused": True}
+
+    ok, detail = await update_listing_quantity(
+        sku=row["sku"], marketplace_id=marketplace_id, quantity=0,
+    )
+    if not ok:
+        raise HTTPException(502, f"eBay quantity update failed: {detail}")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """UPDATE ebay_listings
+                  SET paused = 1, paused_at = ?, paused_reason = 'manual',
+                      updated_at = ?
+                WHERE asin = ? AND marketplace_id = ?""",
+            (now_iso, now_iso, asin, marketplace_id),
+        )
+    return {"ok": True, "paused": True}
+
+
+@app.post("/api/listings/{asin}/{marketplace_id}/resume")
+async def api_listing_resume(asin: str, marketplace_id: str):
+    """Restore the eBay listing's previous quantity."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM ebay_listings WHERE asin = ? AND marketplace_id = ?",
+            (asin, marketplace_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Listing not found")
+    if not row["paused"]:
+        return {"ok": True, "already_active": True}
+
+    qty = int(row["last_quantity"] or 1)
+    ok, detail = await update_listing_quantity(
+        sku=row["sku"], marketplace_id=marketplace_id, quantity=qty,
+    )
+    if not ok:
+        raise HTTPException(502, f"eBay quantity update failed: {detail}")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            """UPDATE ebay_listings
+                  SET paused = 0, paused_at = NULL, paused_reason = NULL,
+                      updated_at = ?
+                WHERE asin = ? AND marketplace_id = ?""",
+            (now_iso, asin, marketplace_id),
+        )
+    return {"ok": True, "resumed": True, "quantity": qty}
 
 
 # ---------------------------------------------------------------------------
