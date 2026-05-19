@@ -236,6 +236,16 @@ def init_db() -> None:
             if "last_attempt_at" not in ocols:
                 conn.execute("ALTER TABLE outbound_messages ADD COLUMN last_attempt_at TEXT")
 
+        # Additive migration for products: store the resolved eBay category so
+        # we don't re-call the Taxonomy API on every publish.
+        cur = conn.execute("PRAGMA table_info(products)").fetchall()
+        if cur:
+            pcols = {c["name"] for c in cur}
+            if "ebay_category_id" not in pcols:
+                conn.execute("ALTER TABLE products ADD COLUMN ebay_category_id TEXT")
+            if "ebay_category_name" not in pcols:
+                conn.execute("ALTER TABLE products ADD COLUMN ebay_category_name TEXT")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 asin TEXT PRIMARY KEY,
@@ -248,7 +258,9 @@ def init_db() -> None:
                 stock_status TEXT,
                 amazon_url TEXT,
                 source_marketplace TEXT,
-                saved_at TEXT
+                saved_at TEXT,
+                ebay_category_id TEXT,
+                ebay_category_name TEXT
             )
         """)
         conn.execute("""
@@ -417,6 +429,19 @@ def init_db() -> None:
                 checked_at TEXT NOT NULL,
                 raw_json TEXT,
                 PRIMARY KEY (carrier, tracking_number)
+            )
+        """)
+
+        # eBay Taxonomy API: suggested-category cache per (marketplace, title).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS category_suggestions_cache (
+                marketplace_id TEXT NOT NULL,
+                title_hash TEXT NOT NULL,
+                category_id TEXT NOT NULL,
+                category_name TEXT,
+                category_path TEXT,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (marketplace_id, title_hash)
             )
         """)
 
@@ -772,6 +797,131 @@ async def maybe_auto_reprice(asin: str, new_amazon_price: Optional[float]) -> No
             )
 
 
+# ---------------------------------------------------------------------------
+# Helpers — eBay Taxonomy API (category suggestions).
+# Used at publish time so listings land in a real category instead of the
+# catch-all "Everything Else". Item-specifics (aspects) build on this in 2.2.
+# ---------------------------------------------------------------------------
+
+# Marketplace → default category-tree id. Stable values, documented in
+# https://developer.ebay.com/api-docs/sell/static/metadata/default-category-tree-ids.html
+EBAY_CATEGORY_TREE_IDS = {
+    "EBAY_US": "0",
+    "EBAY_GB": "3",
+    "EBAY_DE": "77",
+    "EBAY_FR": "71",
+    "EBAY_IT": "101",
+    "EBAY_ES": "186",
+    "EBAY_AU": "15",
+    "EBAY_CA": "2",
+    "EBAY_AT": "16",
+    "EBAY_BE": "23",
+    "EBAY_CH": "193",
+    "EBAY_IE": "205",
+    "EBAY_NL": "146",
+    "EBAY_PL": "212",
+    "EBAY_SG": "216",
+    "EBAY_HK": "201",
+}
+
+
+def _category_tree_id(marketplace_id: str) -> str:
+    return EBAY_CATEGORY_TREE_IDS.get(marketplace_id, "0")
+
+
+def _title_hash(s: str) -> str:
+    """Cheap stable key so we cache suggestions per (marketplace, query).
+
+    We don't care about cryptographic strength — just stable across runs.
+    """
+    import hashlib
+    return hashlib.sha1((s or "").strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+async def get_category_suggestions(
+    *, token: str, marketplace_id: str, query: str,
+) -> list[dict[str, Any]]:
+    """Return up to 10 category suggestions for `query`.
+
+    Each entry: {category_id, category_name, category_path, score}.
+    Cached for 30 days per (marketplace, title hash) in `category_suggestions_cache`.
+    """
+    if not query or not query.strip():
+        return []
+    tree_id = _category_tree_id(marketplace_id)
+    qhash = _title_hash(query)
+
+    # Cache hit?
+    with db() as conn:
+        cached = conn.execute(
+            "SELECT category_id, category_name, category_path, fetched_at "
+            "FROM category_suggestions_cache "
+            "WHERE marketplace_id = ? AND title_hash = ?",
+            (marketplace_id, qhash),
+        ).fetchone()
+    if cached:
+        try:
+            age_days = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(cached["fetched_at"])
+            ).days
+        except (TypeError, ValueError):
+            age_days = 999
+        if age_days < 30:
+            return [{
+                "category_id": cached["category_id"],
+                "category_name": cached["category_name"],
+                "category_path": cached["category_path"],
+                "cached": True,
+            }]
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "X-EBAY-C-MARKETPLACE-ID": marketplace_id,
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{EBAY_API_BASE}/commerce/taxonomy/v1/category_tree/{tree_id}/get_category_suggestions",
+            headers=headers, params={"q": query[:80]},
+        )
+    if r.status_code != 200:
+        raise HTTPException(502, f"eBay category-suggestions failed: {r.text[:300]}")
+
+    suggestions = (r.json() or {}).get("categorySuggestions") or []
+    out = []
+    for s in suggestions[:10]:
+        cat = s.get("category") or {}
+        ancestors = s.get("categoryTreeNodeAncestors") or []
+        # Build a human path "Home > Furniture > Chairs"
+        path_parts = [a.get("categoryName") for a in reversed(ancestors)]
+        path_parts.append(cat.get("categoryName") or "")
+        out.append({
+            "category_id": cat.get("categoryId"),
+            "category_name": cat.get("categoryName"),
+            "category_path": " > ".join([p for p in path_parts if p]),
+            "score": s.get("relevancy"),
+        })
+
+    if out:
+        top = out[0]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO category_suggestions_cache
+                     (marketplace_id, title_hash, category_id, category_name, category_path, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(marketplace_id, title_hash) DO UPDATE SET
+                     category_id   = excluded.category_id,
+                     category_name = excluded.category_name,
+                     category_path = excluded.category_path,
+                     fetched_at    = excluded.fetched_at""",
+                (marketplace_id, qhash, top["category_id"],
+                 top["category_name"], top["category_path"], now_iso),
+            )
+    return out
+
+
 async def ensure_business_policies(headers: dict, marketplace_id: str) -> dict:
     """Ensure default fulfillment/payment/return policies exist; return their IDs."""
     policy_headers = {**headers}
@@ -908,7 +1058,7 @@ class ListEbayIn(BaseModel):
     price: Optional[float] = None          # override listing price (defaults to Amazon price + 30%)
     quantity: int = 1
     title: Optional[str] = None            # override the eBay listing title (≤80 chars)
-    category_id: str = "139971"            # default: "Everything Else" (works in sandbox)
+    category_id: Optional[str] = None      # If None, auto-detect via Taxonomy API (or use stored override)
     marketplace_id: str = "EBAY_US"
     fulfillment_policy_id: Optional[str] = None
     payment_policy_id: Optional[str] = None
@@ -1162,7 +1312,7 @@ class ListEbayBulkIn(BaseModel):
     price: Optional[float] = None
     quantity: int = 1
     titles: Optional[dict[str, str]] = None  # asin -> custom title
-    category_id: str = "139971"
+    category_id: Optional[str] = None        # If None, each product auto-detects (or uses its stored override)
     marketplace_id: str = "EBAY_US"
     override_vero: bool = False
 
@@ -1240,6 +1390,30 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
     description = product.get("description") or title
     images = product.get("images") or []
 
+    # --- Resolve eBay category (Taxonomy API) ---
+    # Precedence: explicit body.category_id > stored override on the product
+    # > auto-detect from title. Result is persisted onto the product row so
+    # subsequent publishes / UI lookups don't re-call the API.
+    category_id = body.category_id or product.get("ebay_category_id")
+    category_name = product.get("ebay_category_name")
+    if not category_id:
+        suggestions = await get_category_suggestions(
+            token=token, marketplace_id=body.marketplace_id, query=title,
+        )
+        if not suggestions:
+            raise HTTPException(
+                422,
+                {"error": "no_category_suggestion",
+                 "message": "eBay returned no category suggestions for this title. Set a category manually."},
+            )
+        category_id = suggestions[0]["category_id"]
+        category_name = suggestions[0].get("category_name")
+        with db() as conn:
+            conn.execute(
+                "UPDATE products SET ebay_category_id = ?, ebay_category_name = ? WHERE asin = ?",
+                (category_id, category_name, asin),
+            )
+
     # Step 0 — ensure a merchant location exists (eBay needs Item.Country)
     async with httpx.AsyncClient() as client:
         r_loc_check = await client.get(
@@ -1309,7 +1483,7 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         "marketplaceId": body.marketplace_id,
         "format": "FIXED_PRICE",
         "listingDescription": description[:500],
-        "categoryId": body.category_id,
+        "categoryId": category_id,
         "merchantLocationKey": merchant_location_key,
         "pricingSummary": {
             "price": {
@@ -1408,7 +1582,56 @@ async def list_on_ebay(asin: str, body: ListEbayIn = ListEbayIn()):
         "listing_id": listing_id,
         "listing_url": ebay_url,
         "listing_price": listing_price,
+        "category_id": category_id,
+        "category_name": category_name,
     }
+
+
+# ---------------------------------------------------------------------------
+# Routes — eBay category detection (Phase 2.1)
+# ---------------------------------------------------------------------------
+
+class CategoryOverrideIn(BaseModel):
+    category_id: str
+    category_name: Optional[str] = None
+    marketplace_id: str = "EBAY_US"
+
+
+@app.post("/api/products/{asin}/suggest-category")
+async def api_suggest_category(asin: str, marketplace_id: str = "EBAY_US"):
+    """Run eBay's category detection for a product. Caches + persists the top hit."""
+    with db() as conn:
+        row = conn.execute("SELECT title FROM products WHERE asin = ?", (asin,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Product not found")
+    title = row["title"] or ""
+    token = await get_valid_token()
+    suggestions = await get_category_suggestions(
+        token=token, marketplace_id=marketplace_id, query=title,
+    )
+    if not suggestions:
+        return {"ok": False, "suggestions": [], "message": "No category suggestions"}
+    top = suggestions[0]
+    with db() as conn:
+        conn.execute(
+            "UPDATE products SET ebay_category_id = ?, ebay_category_name = ? WHERE asin = ?",
+            (top["category_id"], top.get("category_name"), asin),
+        )
+    return {"ok": True, "suggestions": suggestions, "selected": top}
+
+
+@app.put("/api/products/{asin}/category")
+def api_set_category(asin: str, payload: CategoryOverrideIn):
+    """Manually pin a product to a specific eBay category."""
+    with db() as conn:
+        existing = conn.execute("SELECT 1 FROM products WHERE asin = ?", (asin,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Product not found")
+        conn.execute(
+            "UPDATE products SET ebay_category_id = ?, ebay_category_name = ? WHERE asin = ?",
+            (payload.category_id, payload.category_name, asin),
+        )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

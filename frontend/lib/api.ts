@@ -37,6 +37,17 @@ export type Product = {
   amazon_url: string;
   source_marketplace: string;
   saved_at: string;
+  // eBay category resolved by the Taxonomy API (Phase 2.1)
+  ebay_category_id?: string | null;
+  ebay_category_name?: string | null;
+};
+
+export type CategorySuggestion = {
+  category_id: string;
+  category_name: string;
+  category_path: string;
+  score?: number;
+  cached?: boolean;
 };
 
 export type Stats = {
